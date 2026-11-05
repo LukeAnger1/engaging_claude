@@ -1,0 +1,457 @@
+#!/usr/bin/env bash
+# ccl: run Claude Code against a local vLLM server on Slurm GPUs (MIT Engaging).
+set -uo pipefail
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+source "$(dirname "$SELF")/../lib/common.sh"
+mkdir -p "$CCL_RUN_DIR"
+
+usage() {
+  cat <<EOF
+usage: ccl [run] [options] [-- claude args...]   start/reuse a local model server and open Claude Code
+       ccl local [-- claude args]    attach to a running server (this job, then any of your jobs), else run defaults
+       ccl cloud [claude args]       normal Claude Code with your Anthropic login
+       ccl mode [local|cloud]        what plain 'claude' uses (needs: source shell/ccl.bashrc)
+       ccl which                     show what plain 'claude' would do
+       ccl attach [jobid] [-- args]  attach Claude Code to a running server
+       ccl status                    list servers
+       ccl stop [jobid|all]          stop server(s) (and release kept -k jobs)
+       ccl models                    list models (ccl-setup list)
+
+run options:
+  -m NAME   model from models.conf          (default: $(default_model))
+  -l N      GPUs for the model (tensor par.) (default: model's min_gpus)
+  -t N      GPUs visible to Claude Code and what it runs (default: 0)
+  -c N      max context length               (default: model's max_len)
+  -k        keep the server after Claude Code exits (outside a job: runs it as an sbatch job)
+  -g TYPE   GPU type for new allocations     (default: ${CCL_GPU_TYPE:-any}; 'any' = no type)
+  -T TIME   walltime for new allocations     (default: $CCL_TIME)
+  -p PART   partition for new allocations    (default: $CCL_PARTITION)
+EOF
+}
+
+# ---------------------------------------------------------------- helpers
+host_s() { hostname -s; }
+# srun --pty only when we have a terminal (lets `ccl ... -- -p "prompt"` work from scripts).
+PTY=(); [[ -t 0 && -t 1 ]] && PTY=(--pty)
+state_file() { echo "$CCL_RUN_DIR/$1.env"; }
+
+# Load a state file into S_* variables. Returns 1 if missing.
+load_state() {
+  local f; f="$(state_file "$1")"; [[ -f "$f" ]] || return 1
+  unset S_JOBID S_PID S_PORT S_MODEL S_HOST S_MODEL_GPUS S_TASK_GPUS S_LOG S_KIND S_READY S_MAX_LEN
+  # shellcheck disable=SC1090
+  source "$f"
+}
+write_state() {  # key=value pairs
+  local f; f="$(state_file "$S_JOBID")"
+  {
+    for k in S_JOBID S_PID S_PORT S_MODEL S_HOST S_MODEL_GPUS S_TASK_GPUS S_LOG S_KIND S_READY S_MAX_LEN; do
+      printf '%s=%q\n' "$k" "${!k:-}"
+    done
+  } >"$f.tmp" && mv -f "$f.tmp" "$f"
+}
+
+# Is the server described by S_* alive? Only checkable on its own host.
+server_alive_here() {
+  [[ "${S_HOST:-}" == "$(host_s)" && -n "${S_PID:-}" ]] || return 1
+  kill -0 "$S_PID" 2>/dev/null || return 1
+  tr '\0' ' ' <"/proc/$S_PID/cmdline" 2>/dev/null | grep -q vllm
+}
+# A regular srun step (not batch/interactive/extern): proctrack/cgroup kills everything in it,
+# setsid or not, when its main task exits.
+ephemeral_step() { [[ "${SLURM_STEP_ID:-}" =~ ^[0-9]+$ ]] && ((SLURM_STEP_ID < 4294967200)); }
+job_running() { [[ "$(squeue -h -j "$1" -o %T 2>/dev/null)" == RUNNING ]]; }
+
+# Visible GPU ids in the current job (comma-separated), empty if none.
+visible_gpus() {
+  if [[ -n "${CUDA_VISIBLE_DEVICES+x}" ]]; then
+    [[ "$CUDA_VISIBLE_DEVICES" == NoDevFiles ]] && return
+    echo "$CUDA_VISIBLE_DEVICES"
+  elif command -v nvidia-smi >/dev/null 2>&1; then
+    local n; n="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU')"
+    ((n > 0)) && seq -s, 0 $((n - 1))
+  fi
+}
+
+free_port() {
+  local py; py="$(type -P python3 || echo "$CCL_VENV/bin/python")"
+  "$py" -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'
+}
+
+mem_total() {  # CCL_MEM_PER_GPU * n
+  local n=$1 num unit
+  num="${CCL_MEM_PER_GPU%%[!0-9]*}"; unit="${CCL_MEM_PER_GPU#"$num"}"
+  echo "$((num * n))${unit:-G}"
+}
+
+stop_server_here() {  # uses S_*
+  [[ -n "${S_PID:-}" ]] || return 0
+  if kill -0 "$S_PID" 2>/dev/null; then
+    info "stopping vLLM ($S_MODEL, pid $S_PID)"
+    kill -TERM -- "-$S_PID" 2>/dev/null || kill -TERM "$S_PID" 2>/dev/null
+    for _ in $(seq 30); do kill -0 "$S_PID" 2>/dev/null || break; sleep 1; done
+    kill -KILL -- "-$S_PID" 2>/dev/null || true
+  fi
+  rm -f "$(state_file "$S_JOBID")"
+}
+
+# start_server KIND -> sets S_* and writes state (READY=0). Needs M_*, MODEL_GPUS, TASK_GPUS, CTX, L.
+start_server() {
+  [[ -x "$CCL_VENV/bin/vllm" ]] || die "vLLM not installed (run: ccl-setup install)"
+  model_pulled "$M_NAME" || die "model '$M_NAME' not downloaded (run on login node: ccl-setup pull $M_NAME)"
+  local port log; port="$(free_port)" || die "could not find a free port"
+  log="$CCL_RUN_DIR/$SLURM_JOB_ID.$M_NAME.log"
+  local -a tool=()
+  [[ "$M_PARSER" != - ]] && tool=(--enable-auto-tool-choice --tool-call-parser "$M_PARSER")
+  local -a extra=(); read -r -a extra <<<"${CCL_VLLM_EXTRA:-}"
+  info "starting vLLM: $M_NAME on GPU(s) $MODEL_GPUS (TP=$L, ctx=$CTX, port $port); log: $log"
+  # setsid: own session, so Ctrl-C / terminal hangup in Claude Code doesn't reach it.
+  CUDA_VISIBLE_DEVICES="$MODEL_GPUS" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  VLLM_CACHE_ROOT="$CCL_DATA/cache/vllm" TRITON_CACHE_DIR="$CCL_DATA/cache/triton" \
+  XDG_CACHE_HOME="$CCL_DATA/cache" VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1 \
+    setsid "$CCL_VENV/bin/vllm" serve "$(model_path "$M_NAME")" \
+      --served-model-name "$M_NAME" --host 127.0.0.1 --port "$port" \
+      --tensor-parallel-size "$L" --max-model-len "$CTX" \
+      "${tool[@]}" "${M_EXTRA[@]}" "${extra[@]}" \
+      </dev/null >"$log" 2>&1 &
+  S_PID=$! S_PORT=$port S_MODEL=$M_NAME S_HOST="$(host_s)" S_JOBID=$SLURM_JOB_ID
+  S_MODEL_GPUS=$MODEL_GPUS S_TASK_GPUS=$TASK_GPUS S_LOG=$log S_KIND=$1 S_READY=0 S_MAX_LEN=$CTX
+  write_state
+}
+
+wait_ready() {
+  local t0=$SECONDS last=0
+  while ((SECONDS - t0 < CCL_READY_TIMEOUT)); do
+    if ! kill -0 "$S_PID" 2>/dev/null; then
+      warn "vLLM exited during startup. Last log lines ($S_LOG):"
+      tail -n 40 "$S_LOG" >&2
+      rm -f "$(state_file "$S_JOBID")"
+      return 1
+    fi
+    if curl -sf -m 2 "http://127.0.0.1:$S_PORT/health" >/dev/null 2>&1; then
+      S_READY=1; write_state
+      info "vLLM ready after $((SECONDS - t0))s"
+      return 0
+    fi
+    if ((SECONDS - last >= 15)); then
+      last=$SECONDS
+      info "  loading ($((SECONDS - t0))s): $(tail -n 1 "$S_LOG" 2>/dev/null | cut -c1-110)"
+    fi
+    sleep 2
+  done
+  warn "timed out after ${CCL_READY_TIMEOUT}s waiting for vLLM; see $S_LOG"
+  return 1
+}
+
+# Export env for Claude Code pointed at the S_* server, with only task GPUs visible.
+claude_env() {
+  export ANTHROPIC_BASE_URL="http://127.0.0.1:$S_PORT"
+  export ANTHROPIC_AUTH_TOKEN=local ANTHROPIC_API_KEY=local
+  export ANTHROPIC_MODEL="$S_MODEL" ANTHROPIC_SMALL_FAST_MODEL="$S_MODEL" \
+         ANTHROPIC_DEFAULT_OPUS_MODEL="$S_MODEL" ANTHROPIC_DEFAULT_SONNET_MODEL="$S_MODEL" \
+         ANTHROPIC_DEFAULT_HAIKU_MODEL="$S_MODEL" CLAUDE_CODE_SUBAGENT_MODEL="$S_MODEL"
+  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_ATTRIBUTION_HEADER=0
+  local mo=$(( ${S_MAX_LEN:-32768} / 4 )); ((mo > 32000)) && mo=32000
+  export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CCL_MAX_OUTPUT_TOKENS:-$mo}"
+  # Unknown model ids default to a 200k window; tell Claude Code the real one so it compacts in time.
+  export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${S_MAX_LEN:-32768}"
+  export CUDA_VISIBLE_DEVICES="${S_TASK_GPUS:-}"   # empty = no GPUs for Claude Code's tools
+  export CCL_ACTIVE=1 CCL_SERVED_MODEL="$S_MODEL"
+}
+
+# Parse run options into OPT_*, CLAUDE_ARGS.
+parse_run_opts() {
+  OPT_MODEL="" OPT_L="" OPT_T="" OPT_CTX="" OPT_KEEP=0 OPT_GTYPE="$CCL_GPU_TYPE" OPT_TIME="$CCL_TIME" OPT_PART="$CCL_PARTITION"
+  CLAUDE_ARGS=()
+  while (($#)); do
+    case "$1" in
+      -m) OPT_MODEL=${2:?-m needs a value}; shift 2 ;;
+      -l) OPT_L=${2:?-l needs a value}; shift 2 ;;
+      -t) OPT_T=${2:?-t needs a value}; shift 2 ;;
+      -c) OPT_CTX=${2:?-c needs a value}; shift 2 ;;
+      -k) OPT_KEEP=1; shift ;;
+      -g) OPT_GTYPE=${2:?-g needs a value}; shift 2 ;;
+      -T) OPT_TIME=${2:?-T needs a value}; shift 2 ;;
+      -p) OPT_PART=${2:?-p needs a value}; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; CLAUDE_ARGS=("$@"); break ;;
+      *) die "unknown option '$1' (pass Claude Code args after --)" ;;
+    esac
+  done
+  [[ "$OPT_GTYPE" == any ]] && OPT_GTYPE=""
+  load_model "${OPT_MODEL:-$(default_model)}"
+  L=${OPT_L:-$M_MIN_GPUS}; T=${OPT_T:-0}; CTX=${OPT_CTX:-$M_MAX_LEN}
+  [[ "$L" =~ ^[1-9][0-9]*$ && "$T" =~ ^[0-9]+$ && "$CTX" =~ ^[0-9]+$ ]] || die "-l must be >=1, -t >=0, -c a number"
+  NEED=$((L + T))
+}
+
+slurm_res_args() {  # for salloc/sbatch
+  RES=(-p "$OPT_PART" --nodes=1 --ntasks=1 --gres="gpu${OPT_GTYPE:+:$OPT_GTYPE}:$NEED"
+       --cpus-per-task=$((NEED * CCL_CPUS_PER_GPU)) --mem="$(mem_total "$NEED")" -t "$OPT_TIME")
+  local -a extra=(); read -r -a extra <<<"$CCL_SALLOC_EXTRA"; RES+=("${extra[@]}")
+}
+
+# Pass-through of the resolved run options (so hops don't depend on default_model changing).
+resolved_opts() { RESOLVED=(-m "$M_NAME" -l "$L" -t "$T" -c "$CTX"); ((OPT_KEEP)) && RESOLVED+=(-k); }
+
+# Running jobs of this user that have a ready ccl server.
+ready_jobs() {
+  local j
+  for j in $(squeue -h -u "$USER" -t R -o %i 2>/dev/null); do
+    load_state "$j" 2>/dev/null && [[ "${S_READY:-0}" == 1 ]] && echo "$j"
+  done
+}
+
+# ---------------------------------------------------------------- commands
+cmd_run() {
+  parse_run_opts "$@"
+  resolved_opts
+  model_pulled "$M_NAME" || die "model '$M_NAME' not downloaded (run on login node: ccl-setup pull $M_NAME)"
+
+  if [[ -z "${SLURM_JOB_ID:-}" ]]; then
+    slurm_res_args
+    if ((OPT_KEEP)); then
+      launch_kept_job; return
+    fi
+    info "no Slurm job: salloc ${RES[*]}"
+    exec salloc -J ccl "${RES[@]}" srun "${PTY[@]}" "$SELF" run "${RESOLVED[@]}" -- "${CLAUDE_ARGS[@]}"
+  fi
+
+  local gl; gl="$(visible_gpus)"
+  local -a gpus=(); IFS=, read -r -a gpus <<<"$gl"
+  if ((${#gpus[@]} == 0)); then
+    [[ -n "${CCL_HOP:-}" ]] && die "job $SLURM_JOB_ID: still no GPUs visible after srun hop"
+    info "job $SLURM_JOB_ID: no GPUs visible here, hopping onto the allocation with srun"
+    CCL_HOP=1 exec srun --overlap "${PTY[@]}" "$SELF" run "${RESOLVED[@]}" -- "${CLAUDE_ARGS[@]}"
+  fi
+  ((${#gpus[@]} >= NEED)) || die "job $SLURM_JOB_ID has ${#gpus[@]} GPU(s) visible, need $NEED (-l $L + -t $T). Exit this job or lower -l/-t."
+  MODEL_GPUS="$(IFS=,; echo "${gpus[*]:0:L}")"
+  TASK_GPUS="$(IFS=,; echo "${gpus[*]:L:T}")"
+
+  local started=0
+  if load_state "$SLURM_JOB_ID" && server_alive_here; then
+    if [[ "$S_MODEL" == "$M_NAME" && "$S_MODEL_GPUS" == "$MODEL_GPUS" && "$S_MAX_LEN" == "$CTX" ]]; then
+      info "reusing running $S_MODEL server (pid $S_PID, port $S_PORT)"
+      if [[ "$S_TASK_GPUS" != "$TASK_GPUS" ]]; then S_TASK_GPUS=$TASK_GPUS; write_state; fi
+    else
+      info "replacing running $S_MODEL server with $M_NAME"
+      stop_server_here
+    fi
+  fi
+  if ! load_state "$SLURM_JOB_ID" || ! server_alive_here; then
+    start_server step
+    started=1
+    # Stop a server we started if we're killed before Claude Code takes over.
+    trap 'stop_server_here; exit 130' INT
+    trap 'stop_server_here; exit 129' HUP TERM
+    wait_ready || exit 1
+  fi
+
+  claude_env
+  if ((started && !OPT_KEEP)); then
+    trap 'stop_server_here; exit 129' HUP TERM
+  else
+    trap - HUP TERM
+  fi
+  trap ':' INT   # Ctrl-C belongs to Claude Code; handler (not ignore) so the child gets default handling
+  "$(real_claude)" "${CLAUDE_ARGS[@]}"
+  local rc=$?
+  if ((started && !OPT_KEEP)); then
+    stop_server_here
+  elif ephemeral_step; then
+    warn "-k: this is a plain srun step ($SLURM_STEP_ID); Slurm kills the server when it ends."
+    warn "    For a persistent server use -k from the login node (sbatch) or inside a salloc shell."
+  else
+    info "vLLM server left running in job $SLURM_JOB_ID ($S_MODEL, port $S_PORT). 'ccl stop' to stop it."
+  fi
+  return $rc
+}
+
+# -k outside a job: run the server as its own sbatch job, then attach an overlap step.
+launch_kept_job() {
+  local jobid
+  jobid="$(sbatch --parsable -J ccl-serve "${RES[@]}" -o "$CCL_RUN_DIR/%j.out" \
+           --wrap "exec '$SELF' _serve ${RESOLVED[*]}")" || die "sbatch failed"
+  jobid="${jobid%%;*}"
+  info "submitted server job $jobid (${RES[*]}); it holds the GPUs until walltime or 'ccl stop $jobid'"
+  local st reason last=""
+  while :; do
+    st="" reason=""
+    read -r st reason < <(squeue -h -j "$jobid" -o '%T %r' 2>/dev/null)
+    case "${st:-}" in
+      RUNNING) if load_state "$jobid" && [[ "$S_READY" == 1 ]]; then break; fi
+               [[ "$last" != loading ]] && info "job $jobid running on $(squeue -h -j "$jobid" -o %N); loading model..." && last=loading ;;
+      PENDING|CONFIGURING) [[ "$last" != "$reason" ]] && info "job $jobid pending ($reason)..." && last=$reason ;;
+      *) warn "job $jobid ended (${st:-gone}). Output:"; tail -n 40 "$CCL_RUN_DIR/$jobid.out" >&2; exit 1 ;;
+    esac
+    sleep 5
+  done
+  info "server ready in job $jobid"
+  attach_remote "$jobid"
+}
+
+# Body of the sbatch server job.
+cmd__serve() {
+  parse_run_opts "$@"
+  local gl; gl="$(visible_gpus)"
+  local -a gpus=(); IFS=, read -r -a gpus <<<"$gl"
+  ((${#gpus[@]} >= NEED)) || die "server job sees ${#gpus[@]} GPU(s), need $NEED"
+  MODEL_GPUS="$(IFS=,; echo "${gpus[*]:0:L}")"
+  TASK_GPUS="$(IFS=,; echo "${gpus[*]:L:T}")"
+  start_server batch
+  trap 'stop_server_here; exit 0' TERM INT HUP
+  wait_ready || exit 1
+  while kill -0 "$S_PID" 2>/dev/null; do wait "$S_PID" 2>/dev/null; done
+  warn "vLLM exited; tail of log:"; tail -n 20 "$S_LOG" >&2
+  rm -f "$(state_file "$S_JOBID")"
+}
+
+attach_remote() {  # jobid [claude args from CLAUDE_ARGS]
+  local -a extra=(); read -r -a extra <<<"${CCL_ATTACH_SRUN_EXTRA:-}"
+  exec srun --jobid "$1" --overlap "${PTY[@]}" "${extra[@]}" "$SELF" attach "$1" -- "${CLAUDE_ARGS[@]}"
+}
+
+# Attach Claude Code to a server. On its node: exec claude. Elsewhere: srun --overlap onto it.
+cmd_attach() {
+  local jobid=""
+  CLAUDE_ARGS=()
+  while (($#)); do
+    case "$1" in --) shift; CLAUDE_ARGS=("$@"); break ;; *) jobid=$1; shift ;; esac
+  done
+  if [[ -z "$jobid" ]]; then
+    if [[ -n "${SLURM_JOB_ID:-}" ]] && load_state "$SLURM_JOB_ID"; then jobid=$SLURM_JOB_ID
+    else
+      local -a js=(); mapfile -t js < <(ready_jobs)
+      ((${#js[@]})) || die "no running ccl server found (ccl status)"
+      ((${#js[@]} > 1)) && info "several servers running (${js[*]}); using ${js[0]}"
+      jobid=${js[0]}
+    fi
+  fi
+  load_state "$jobid" || die "no ccl server recorded for job $jobid"
+  if [[ "$S_HOST" == "$(host_s)" && "${SLURM_JOB_ID:-}" == "$jobid" ]]; then
+    server_alive_here || { rm -f "$(state_file "$jobid")"; die "server for job $jobid is no longer running (cleared stale state; rerun to start one)"; }
+    [[ "$S_READY" == 1 ]] || die "server for job $jobid is still loading (see $S_LOG)"
+    claude_env
+    exec "$(real_claude)" "${CLAUDE_ARGS[@]}"
+  fi
+  job_running "$jobid" || die "job $jobid is not running"
+  info "attaching to $S_MODEL in job $jobid on $S_HOST"
+  attach_remote "$jobid"
+}
+
+cmd_local() {
+  [[ "${1:-}" == -- ]] && shift
+  CLAUDE_ARGS=("$@")
+  if [[ -n "${SLURM_JOB_ID:-}" ]] && load_state "$SLURM_JOB_ID" && server_alive_here && [[ "$S_READY" == 1 ]]; then
+    cmd_attach "$SLURM_JOB_ID" -- "$@"
+  fi
+  local j; j="$(ready_jobs | head -1)"
+  if [[ -n "$j" ]]; then cmd_attach "$j" -- "$@"; fi
+  local -a d=(); read -r -a d <<<"$CCL_DEFAULT_ARGS"
+  cmd_run "${d[@]}" -- "$@"
+}
+
+cmd_which() {
+  echo "mode: $(get_mode)  (plain 'claude' -> $( [[ $(get_mode) == cloud ]] && echo 'Anthropic cloud' || echo 'local model'))"
+  if [[ -n "${SLURM_JOB_ID:-}" ]] && load_state "$SLURM_JOB_ID" && server_alive_here; then
+    echo "local: would attach to $S_MODEL in this job ($SLURM_JOB_ID, port $S_PORT, task GPUs '${S_TASK_GPUS}')"; return
+  fi
+  local j; j="$(ready_jobs | head -1)"
+  if [[ -n "$j" ]]; then
+    load_state "$j"; echo "local: would attach to $S_MODEL in job $j on $S_HOST (srun --overlap)"; return
+  fi
+  local -a d=(); read -r -a d <<<"$CCL_DEFAULT_ARGS"
+  parse_run_opts "${d[@]}"
+  if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    echo "local: no server running -> would start $M_NAME in job $SLURM_JOB_ID (L=$L, T=$T, ctx=$CTX)"
+  else
+    slurm_res_args
+    echo "local: no server running -> would salloc ${RES[*]} and start $M_NAME (L=$L, T=$T, ctx=$CTX)"
+  fi
+  model_pulled "$M_NAME" || echo "warning: $M_NAME is not downloaded (ccl-setup pull $M_NAME)"
+}
+
+cmd_status() {
+  local f any=0
+  for f in "$CCL_RUN_DIR"/*.env; do
+    [[ -e "$f" ]] || continue
+    local j; j="$(basename "$f" .env)"
+    load_state "$j" || continue
+    local st; st="$(squeue -h -j "$j" -o %T 2>/dev/null)"
+    if [[ -z "$st" ]]; then rm -f "$f"; continue; fi   # job gone -> stale
+    any=1
+    local health="?"
+    if [[ "$S_HOST" == "$(host_s)" ]]; then
+      if server_alive_here; then
+        curl -sf -m 2 "http://127.0.0.1:$S_PORT/health" >/dev/null && health=healthy || health=loading
+      else health=dead; fi
+    else
+      [[ "$S_READY" == 1 ]] && health=ready || health=loading
+    fi
+    printf 'job %-10s %-8s %-20s host=%-10s port=%-6s model_gpus=%-5s task_gpus=%-5s kind=%-5s %s\n' \
+      "$j" "$st" "$S_MODEL" "$S_HOST" "$S_PORT" "$S_MODEL_GPUS" "${S_TASK_GPUS:--}" "$S_KIND" "$health"
+    echo "    log: $S_LOG"
+  done
+  ((any)) || echo "no ccl servers running"
+}
+
+stop_one() {
+  local j=$1
+  load_state "$j" || { warn "no server recorded for job $j"; return 1; }
+  if [[ "$S_KIND" == batch ]]; then
+    info "cancelling server job $j"; scancel "$j"; rm -f "$(state_file "$j")"; return
+  fi
+  if [[ "$S_HOST" == "$(host_s)" ]]; then stop_server_here; return; fi
+  job_running "$j" || { rm -f "$(state_file "$j")"; return; }
+  srun --jobid "$j" --overlap "$SELF" stop "$j"
+}
+
+cmd_stop() {
+  local arg=${1:-}
+  if [[ "$arg" == all ]]; then
+    local f; for f in "$CCL_RUN_DIR"/*.env; do [[ -e "$f" ]] && stop_one "$(basename "$f" .env)"; done; return
+  fi
+  if [[ -z "$arg" ]]; then
+    if [[ -n "${SLURM_JOB_ID:-}" && -f "$(state_file "$SLURM_JOB_ID")" ]]; then arg=$SLURM_JOB_ID
+    else
+      local -a fs=("$CCL_RUN_DIR"/*.env)
+      [[ -e "${fs[0]}" ]] || { info "no ccl servers running"; return; }
+      ((${#fs[@]} == 1)) || die "several servers; say which: ccl stop <jobid>|all (see ccl status)"
+      arg="$(basename "${fs[0]}" .env)"
+    fi
+  fi
+  stop_one "$arg"
+}
+
+cmd_cloud() {
+  unset ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL \
+        ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL CLAUDE_CODE_SUBAGENT_MODEL \
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC CLAUDE_CODE_ATTRIBUTION_HEADER CLAUDE_CODE_MAX_OUTPUT_TOKENS \
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS CCL_ACTIVE CCL_SERVED_MODEL
+  [[ "${ANTHROPIC_API_KEY:-}" == local ]] && unset ANTHROPIC_API_KEY
+  [[ "${ANTHROPIC_AUTH_TOKEN:-}" == local ]] && unset ANTHROPIC_AUTH_TOKEN
+  exec "$(real_claude)" "$@"
+}
+
+cmd_mode() {
+  case "${1:-}" in
+    "") echo "$(get_mode)" ;;
+    local|cloud) echo "$1" >"$CCL_STATE/mode"; info "plain 'claude' now uses: $1" ;;
+    *) die "usage: ccl mode [local|cloud]" ;;
+  esac
+}
+
+case "${1:-}" in
+  run)     shift; cmd_run "$@" ;;
+  local)   shift; cmd_local "$@" ;;
+  cloud)   shift; cmd_cloud "$@" ;;
+  mode)    shift; cmd_mode "$@" ;;
+  which)   shift; cmd_which ;;
+  attach)  shift; cmd_attach "$@" ;;
+  status)  shift; cmd_status ;;
+  stop)    shift; cmd_stop "$@" ;;
+  models)  shift; exec "$(dirname "$SELF")/ccl-setup" list ;;
+  _serve)  shift; cmd__serve "$@" ;;
+  help|-h|--help) usage ;;
+  *)       cmd_run "$@" ;;
+esac

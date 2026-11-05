@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# ccl-setup: install vLLM + hf CLI, manage local model weights. Run on the login node
+# (compute nodes may not have internet).
+set -euo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
+
+usage() {
+  cat <<EOF
+usage: ccl-setup <command>
+  install                 create venv on pool, install vLLM + hf CLI (+ Claude Code if missing)
+  list                    show registered models (* = default, [x] = downloaded)
+  pull <name>|all         download weights to $CCL_MODELS_DIR/<name>
+  default <name>          set the model plain 'claude' / 'ccl' uses
+  add <name> <hf_repo> <tool_parser> <min_gpus> <max_len> [extra vllm args...]
+  remove <name> [--delete] unregister a model (--delete also removes its weights)
+  login                   hf auth login (for gated models; token stored under $HF_HOME)
+  info                    print paths and config
+EOF
+}
+
+cmd_install() {
+  command -v uv >/dev/null || { info "installing uv"; curl -LsSf https://astral.sh/uv/install.sh | sh; export PATH="$HOME/.local/bin:$PATH"; }
+  mkdir -p "$CCL_DATA" "$CCL_MODELS_DIR" "$CCL_STATE/run" "$HF_HOME"
+  if [[ ! -x "$CCL_VENV/bin/python" ]]; then
+    info "creating venv $CCL_VENV (python $CCL_PYTHON)"
+    uv venv --python "$CCL_PYTHON" "$CCL_VENV"
+  fi
+  info "installing $CCL_VLLM_SPEC + huggingface_hub (this takes a while)"
+  uv pip install --python "$CCL_VENV/bin/python" "$CCL_VLLM_SPEC" huggingface_hub
+  # Prebuilt FlashInfer kernels: compute nodes have no nvcc/CUDA toolkit, so JIT builds fail
+  # ("Could not find nvcc"). `vllm download-kernels` can't run on the login node (no libcuda),
+  # so call flashinfer's installer directly. Run from /tmp so cwd isn't on sys.path.
+  info "installing prebuilt FlashInfer kernels"
+  (cd /tmp && FLASHINFER_DISABLE_VERSION_CHECK=1 "$CCL_VENV/bin/python" -m flashinfer download-kernels) \
+    || warn "FlashInfer kernel download failed; vLLM may fail at startup without nvcc"
+  "$CCL_VENV/bin/python" -c 'import vllm, torch; print("vllm", vllm.__version__, "| torch", torch.__version__, "| cuda", torch.version.cuda)'
+  if [[ ! -x "$(real_claude)" ]]; then
+    info "installing Claude Code"
+    curl -fsSL https://claude.ai/install.sh | bash
+  fi
+  info "done. Next: ccl-setup pull gpt-oss-20b"
+}
+
+cmd_list() {
+  local d; d="$(default_model)"
+  printf '  %-3s %-22s %-42s %-12s %-4s %s\n' "" NAME HF_REPO PARSER GPUS MAX_LEN
+  while read -r name repo parser gpus len _; do
+    local mark="[ ]"; model_pulled "$name" && mark="[x]"
+    [[ "$name" == "$d" ]] && mark="${mark}*"
+    printf '  %-4s%-22s %-42s %-12s %-4s %s\n' "$mark" "$name" "$repo" "$parser" "$gpus" "$len"
+  done < <(awk '!/^[[:space:]]*(#|$)/' "$CCL_MODELS_CONF")
+}
+
+pull_one() {
+  load_model "$1"
+  local dir; dir="$(model_path "$M_NAME")"
+  [[ -x "$CCL_VENV/bin/hf" ]] || die "hf CLI missing; run: ccl-setup install"
+  info "downloading $M_REPO -> $dir"
+  mkdir -p "$dir"
+  # Skip duplicate/alternate weight formats (e.g. gpt-oss ships original/ and metal/ copies).
+  "$CCL_VENV/bin/hf" download "$M_REPO" --local-dir "$dir" \
+      --exclude 'original/*' --exclude 'metal/*' --exclude '*.gguf' --exclude '*.pth'
+  touch "$dir/.ccl-complete"
+  info "pulled $M_NAME ($(du -sh "$dir" 2>/dev/null | cut -f1))"
+}
+
+cmd_pull() {
+  [[ $# -ge 1 ]] || die "usage: ccl-setup pull <name>|all"
+  if [[ "$1" == all ]]; then for n in $(model_names); do pull_one "$n"; done
+  else pull_one "$1"; fi
+}
+
+cmd_default() {
+  [[ $# -eq 1 ]] || die "usage: ccl-setup default <name>"
+  model_line "$1" >/dev/null || die "unknown model '$1'"
+  model_pulled "$1" || warn "'$1' is not downloaded yet (ccl-setup pull $1)"
+  mkdir -p "$CCL_STATE"; echo "$1" >"$CCL_STATE/default_model"
+  info "default model: $1"
+}
+
+cmd_add() {
+  [[ $# -ge 5 ]] || die "usage: ccl-setup add <name> <hf_repo> <tool_parser> <min_gpus> <max_len> [extra vllm args...]"
+  local name=$1 repo=$2 parser=$3 gpus=$4 len=$5; shift 5
+  [[ "$name" != */* && "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "bad name '$name' (letters, digits, . _ - only)"
+  [[ "$repo" == */* ]] || die "hf_repo should look like org/model"
+  [[ "$gpus" =~ ^[0-9]+$ && "$len" =~ ^[0-9]+$ ]] || die "min_gpus and max_len must be integers"
+  model_line "$name" >/dev/null && die "'$name' already exists (ccl-setup remove $name first)"
+  printf '%-20s %-40s %-12s %-2s %-7s %s\n' "$name" "$repo" "$parser" "$gpus" "$len" "$*" | sed 's/[[:space:]]*$//' >>"$CCL_MODELS_CONF"
+  info "added $name. Download with: ccl-setup pull $name"
+}
+
+cmd_remove() {
+  [[ $# -ge 1 ]] || die "usage: ccl-setup remove <name> [--delete]"
+  local name=$1
+  model_line "$name" >/dev/null || die "unknown model '$name'"
+  local tmp; tmp="$(mktemp)"
+  awk -v n="$name" '/^[[:space:]]*(#|$)/ || $1!=n' "$CCL_MODELS_CONF" >"$tmp" && cat "$tmp" >"$CCL_MODELS_CONF"; rm -f "$tmp"
+  if [[ "${2:-}" == --delete && -d "$(model_path "$name")" ]]; then
+    rm -rf -- "$(model_path "$name")"; info "deleted weights for $name"
+  fi
+  [[ "$(cat "$CCL_STATE/default_model" 2>/dev/null)" == "$name" ]] && rm -f "$CCL_STATE/default_model"
+  info "removed $name"
+}
+
+cmd_info() {
+  cat <<EOF
+repo        $CCL_REPO
+data        $CCL_DATA
+venv        $CCL_VENV
+models      $CCL_MODELS_DIR
+HF_HOME     $HF_HOME
+state       $CCL_STATE
+partition   $CCL_PARTITION  gpu=${CCL_GPU_TYPE:-any}  time=$CCL_TIME  cpus/gpu=$CCL_CPUS_PER_GPU  mem/gpu=$CCL_MEM_PER_GPU
+default     model=$(default_model)  args="$CCL_DEFAULT_ARGS"  mode=$(get_mode)
+claude      $(real_claude)
+EOF
+}
+
+case "${1:-}" in
+  install) shift; cmd_install "$@" ;;
+  list|ls) shift; cmd_list "$@" ;;
+  pull)    shift; cmd_pull "$@" ;;
+  default) shift; cmd_default "$@" ;;
+  add)     shift; cmd_add "$@" ;;
+  remove|rm) shift; cmd_remove "$@" ;;
+  login)   shift; exec "$CCL_VENV/bin/hf" auth login "$@" ;;
+  info)    shift; cmd_info ;;
+  ""|-h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac
