@@ -10,6 +10,7 @@ usage() {
 usage: ccl [run] [options] [-- claude args...]   start/reuse a local model server and open Claude Code
        ccl local [-- claude args]    attach to a running server (this job, then any of your jobs), else run defaults
        ccl cloud [claude args]       normal Claude Code with your Anthropic login
+       ccl batch [options] [-o FILE] prompt  sbatch one -p prompt (skips permission prompts), then free GPUs
        ccl mode [local|cloud]        what plain 'claude' uses (needs: source shell/ccl.bashrc)
        ccl which                     show what plain 'claude' would do
        ccl attach [jobid] [-- args]  attach Claude Code to a running server
@@ -26,6 +27,7 @@ run options:
   -g TYPE   GPU type for new allocations     (default: ${CCL_GPU_TYPE:-any}; 'any' = no type)
   -T TIME   walltime for new allocations     (default: $CCL_TIME)
   -p PART   partition for new allocations    (default: $CCL_PARTITION)
+  -o FILE   batch only: output file           (default: ccl-batch-<jobid>.out)
 EOF
 }
 
@@ -433,6 +435,38 @@ cmd_cloud() {
   exec "$(real_claude)" "$@"
 }
 
+cmd_batch() {
+  local output_file="" ; local -a run_args=()
+  while (($#)); do
+    case "$1" in
+      -o) output_file=${2:?-o needs a value}; shift 2 ;;
+      -k) die "batch always frees resources when done; -k is not allowed" ;;
+      -m|-l|-t|-c|-g|-T|-p) run_args+=("$1" "${2:?$1 needs a value}"); shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; break ;;
+      -*) die "unknown batch option '$1'" ;;
+      *) break ;;
+    esac
+  done
+  local prompt="$*"; [[ -n "$prompt" ]] || prompt="$(cat)"
+  [[ -n "$prompt" ]] || die "no prompt given. Usage: ccl batch [options] \"prompt text\""
+
+  parse_run_opts "${run_args[@]}"; resolved_opts
+  model_pulled "$M_NAME" || die "model '$M_NAME' not downloaded (run on login node: ccl-setup pull $M_NAME)"
+  # Non-interactive: nobody can approve tool use, so skip permission prompts.
+  local -a cmd=("$SELF" run "${RESOLVED[@]}" -- --dangerously-skip-permissions -p "$prompt")
+
+  if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    if [[ -n "$output_file" ]]; then "${cmd[@]}" >"$output_file"; else "${cmd[@]}"; fi
+    return
+  fi
+  slurm_res_args
+  local out="${output_file:-ccl-batch-%j.out}" jobid
+  jobid="$(sbatch --parsable -J ccl-batch "${RES[@]}" -o "$out" \
+           --wrap "$(printf '%q ' "${cmd[@]}")")" || die "sbatch failed"
+  info "submitted batch job $jobid ($NEED GPU(s)); output -> ${out//%j/$jobid}"
+}
+
 cmd_mode() {
   case "${1:-}" in
     "") echo "$(get_mode)" ;;
@@ -445,6 +479,7 @@ case "${1:-}" in
   run)     shift; cmd_run "$@" ;;
   local)   shift; cmd_local "$@" ;;
   cloud)   shift; cmd_cloud "$@" ;;
+  batch)   shift; cmd_batch "$@" ;;
   mode)    shift; cmd_mode "$@" ;;
   which)   shift; cmd_which ;;
   attach)  shift; cmd_attach "$@" ;;

@@ -25,6 +25,7 @@ To make the toggle permanent, add `source ~/engaging_claude/shell/ccl.bashrc` to
 | `ccl [-m model] [-l N] [-t N] [-c ctx] [-k] [-g type] [-T time] [-- claude args]` | Starts (or reuses) a server and opens Claude Code |
 | `ccl local` / `claude` | Attaches to a running server (this job first, then any of your running jobs), otherwise `ccl $CCL_DEFAULT_ARGS` |
 | `ccl cloud` / `claude --cloud` | Normal Claude Code with your Anthropic login |
+| `ccl batch [run options] [-o FILE] "prompt"` | Submits an sbatch job that runs one `-p` prompt (with `--dangerously-skip-permissions`), then stops the server and frees the GPUs |
 | `ccl mode [local\|cloud]` | Sets what plain `claude` means |
 | `ccl which` / `claude --which` | Shows what would happen |
 | `ccl attach [jobid]` | Attaches Claude Code to a running server (`srun --overlap` if it's on another node) |
@@ -40,6 +41,70 @@ To make the toggle permanent, add `source ~/engaging_claude/shell/ccl.bashrc` to
 - `ccl -m qwen3-coder-30b-fp8 -l 1 -t 1` uses 1 GPU for the model and 1 GPU for your code.
 - `ccl -m gpt-oss-120b -l 2 -t 0 -g h200 -T 2:00:00` puts a big model on 2 H200s.
 - `claude -- -p "summarize this repo"` runs one-shot print mode on the local model.
+- `ccl batch -m qwen3-coder-30b-fp8 -l 1 -t 1 -o output.txt "Summarize this repository"` runs Claude in batch mode with a preset prompt.
+
+## Batch jobs (`ccl batch`)
+
+`ccl batch` submits a Slurm job that starts vLLM, runs **one** Claude Code prompt (`-p`), then stops the server.
+The job exits and the GPUs are freed. You don't need to stay logged in.
+
+```bash
+ccl batch [-m model] [-l N] [-t N] [-c ctx] [-g type] [-T time] [-p partition] [-o FILE] "prompt"
+```
+
+- It takes the same model and GPU options as `ccl`. `-k` is rejected, because batch always frees its resources.
+- `-o FILE` sets where output goes. The default is `ccl-batch-<jobid>.out` in the directory you submitted from.
+- Claude Code works in the directory you submit from.
+- **Permissions:** batch runs Claude Code with `--dangerously-skip-permissions`, because nobody is there to
+  approve tool calls. The model can edit and delete files and run any command as you. Submit from a
+  directory you're comfortable letting it change.
+- If you run it inside an existing Slurm job (e.g. a `salloc` shell), it runs right there instead of submitting.
+- The model has to be downloaded first (`ccl-setup pull <name>`). Otherwise `ccl batch` refuses to submit.
+
+**Use a specific model:**
+
+```bash
+ccl-setup list                                                    # see what's downloaded
+ccl batch "Summarize this repository"                             # default model (ccl-setup default)
+ccl batch -m qwen3-coder-30b-fp8 -l 1 -t 1 -o summary.txt "Summarize this repository"
+ccl batch -m gpt-oss-120b -l 2 -t 0 -g h200 -T 1:00:00 "Review lib/common.sh for bugs"
+```
+
+**Read the prompt from a file or stdin:** if no prompt argument is given, `ccl batch` reads it from stdin.
+
+```bash
+ccl batch -m qwen3-coder-30b-fp8 -o review.txt < prompts/review.md
+echo "Write unit tests for src/parser.py and run them" | ccl batch -t 1
+```
+
+**Call it from your own scripts:** `ccl batch` returns right after submitting, so you can loop over
+prompts or projects. Each call is its own job with its own GPUs. The QoS cap is 2 GPUs per user, so
+extra jobs just wait in the queue.
+
+```bash
+#!/bin/bash
+# run_reviews.sh: one batch job per project directory
+mkdir -p ~/reviews
+for dir in ~/projects/*/; do
+  ( cd "$dir" && ccl batch -m qwen3-coder-30b-fp8 -l 1 -t 0 -T 0:30:00 \
+      -o "$HOME/reviews/$(basename "$dir").txt" \
+      "Review this project and list the top 5 bugs with file:line references" )
+done
+squeue --me -n ccl-batch                          # watch the jobs
+```
+
+```bash
+# one job per prompt file
+mkdir -p results
+for f in prompts/*.md; do
+  ccl batch -o "results/$(basename "$f" .md).txt" < "$f"
+done
+```
+
+The directory for `-o` must already exist, or Slurm drops the output.
+
+Use `squeue --me -n ccl-batch` to check on jobs and `scancel <jobid>` to cancel one. Server logs are at
+`~/.ccl/run/<jobid>.<model>.log`.
 
 ## How it works
 
