@@ -14,6 +14,7 @@ usage: ccl-setup <command>
   add <name> <hf_repo> <tool_parser> <min_gpus> <max_len> [extra vllm args...]
   remove <name> [--delete] unregister a model (--delete also removes its weights)
   login                   hf auth login (for gated models; token stored under $HF_HOME)
+  skill [--remove]        install the 'engaging' Claude Code skill (eng jobs) into ~/.claude/skills
   info                    print paths and config
 EOF
 }
@@ -38,6 +39,7 @@ cmd_install() {
     info "installing Claude Code"
     curl -fsSL https://claude.ai/install.sh | bash
   fi
+  cmd_skill
   info "done. Next: ccl-setup pull gpt-oss-20b"
 }
 
@@ -102,6 +104,21 @@ cmd_remove() {
   info "removed $name"
 }
 
+# Symlink skills/engaging into ~/.claude/skills so Claude Code uses `eng` in any directory.
+cmd_skill() {
+  local src="$CCL_REPO/skills/engaging" dst="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/engaging"
+  if [[ "${1:-}" == --remove ]]; then
+    [[ -L "$dst" ]] && rm -f "$dst" && info "removed skill $dst" || info "no skill symlink at $dst"
+    return 0
+  fi
+  if [[ -e "$dst" && ! -L "$dst" ]]; then
+    warn "$dst exists and is not a symlink; leaving it alone"; return 0
+  fi
+  mkdir -p "$(dirname "$dst")"
+  ln -sfn "$src" "$dst"
+  info "installed Claude Code skill: $dst -> $src"
+}
+
 cmd_info() {
   cat <<EOF
 repo        $CCL_REPO
@@ -123,6 +140,7 @@ case "${1:-}" in
   default) shift; cmd_default "$@" ;;
   add)     shift; cmd_add "$@" ;;
   remove|rm) shift; cmd_remove "$@" ;;
+  skill)   shift; cmd_skill "$@" ;;
   login)   shift; exec "$CCL_VENV/bin/hf" auth login "$@" ;;
   info)    shift; cmd_info ;;
   ""|-h|--help|help) usage ;;
