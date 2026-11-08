@@ -31,6 +31,27 @@ CCL_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Seconds to wait for vLLM /health.
 : "${CCL_READY_TIMEOUT:=1800}"
+
+# ---- eng (general Slurm jobs: bin/eng) ----
+: "${ENG_MODE:=auto}"                    # auto | local (sbatch on PATH) | ssh (from a laptop)
+: "${ENG_CPU_PARTITION:=mit_normal}"
+: "${ENG_GPU_PARTITION:=$CCL_PARTITION}"
+: "${ENG_PREEMPT_PARTITION:=mit_preemptable}"   # 2 days, may be preempted
+: "${ENG_TEST_PARTITION:=mit_quicktest}"
+: "${ENG_GPU_TYPE:=any}"                 # default --gpu-type for eng jobs (any = no constraint)
+: "${ENG_MAX_GPUS:=2}"                   # per-user QoS GPU cap on ENG_GPU_PARTITION (warning only)
+: "${ENG_GPU_MAX_TIME:=06:00:00}"        # time limit of ENG_GPU_PARTITION (warning only)
+: "${ENG_CPU_MAX_TIME:=12:00:00}"        # time limit of ENG_CPU_PARTITION (warning only)
+: "${ENG_ACCOUNT:=}"
+: "${ENG_DEFAULT_MODULES:=}"             # loaded in every eng job, e.g. "miniforge"
+: "${ENG_WORKDIR:=}"                     # empty = current dir (local) or ~ (ssh)
+: "${ENG_LOG_DIR:=~/.ccl/jobs/logs}"     # job stdout+stderr ('~' expands on the cluster)
+: "${ENG_JOB_DIR:=~/.ccl/jobs/scripts}"  # generated sbatch scripts
+# ssh mode (running eng on your laptop):
+: "${ENG_USER:=${USER:-}}"               # your Kerberos username
+: "${ENG_HOST:=orcd-login001.mit.edu}"
+: "${ENG_CONTROL_PATH:=$HOME/.ssh/eng-cm-%r@%h:%p}"
+: "${ENG_CONTROL_PERSIST:=12h}"
 # ================================================================
 
 [[ -f "$CCL_REPO/config.local.sh" ]] && source "$CCL_REPO/config.local.sh"

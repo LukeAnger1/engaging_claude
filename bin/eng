@@ -1,0 +1,733 @@
+#!/usr/bin/env bash
+# eng: run Slurm jobs (batch, CPU, GPU, arrays) on MIT Engaging, built for Claude Code.
+#
+# Two transports, picked automatically:
+#   local  sbatch is on PATH (you're on Engaging, e.g. Claude Code started by `ccl`):
+#          Slurm commands run directly. Inherited SLURM_*/CUDA_VISIBLE_DEVICES/
+#          ANTHROPIC_*/CCL_* vars are stripped, so jobs submitted from inside a ccl
+#          session get their own fresh allocation.
+#   ssh    anywhere else (your laptop): runs over one SSH ControlMaster connection
+#          that you open with `eng connect` (password + Duo). Every other command
+#          reuses it non-interactively, so Claude Code never hangs on a prompt.
+#
+# Run `eng help` for usage. Config lives in lib/common.sh / config.local.sh (ENG_*).
+set -euo pipefail
+shopt -s inherit_errexit 2>/dev/null || true
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+source "$(dirname "$SELF")/../lib/common.sh"
+
+die()  { printf 'eng: %s\n' "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*" >&2; }
+warn() { printf 'eng: warning: %s\n' "$*" >&2; }
+
+# Testing hook: replace the transport with a command prefix (e.g. "env PATH=...").
+ENG_SSH_CMD="${ENG_SSH_CMD:-}"
+if [[ "$ENG_MODE" == auto ]]; then
+  if [[ -n "$ENG_SSH_CMD" ]]; then ENG_MODE=ssh
+  elif command -v sbatch >/dev/null 2>&1; then ENG_MODE=local
+  else ENG_MODE=ssh; fi
+fi
+[[ "$ENG_MODE" == local || "$ENG_MODE" == ssh ]] || die "ENG_MODE must be auto, local or ssh"
+# Default job working dir: where you are (local) or your home (ssh).
+if [[ -z "$ENG_WORKDIR" ]]; then
+  if [[ "$ENG_MODE" == local ]]; then ENG_WORKDIR="$PWD"; else ENG_WORKDIR="~"; fi
+fi
+
+TARGET="${ENG_USER}@${ENG_HOST}"
+SSH_OPTS=(-o "ControlPath=${ENG_CONTROL_PATH}" -o ServerAliveInterval=60)
+
+# ----------------------------------------------------------------------------
+# Transport
+# ----------------------------------------------------------------------------
+
+# Env vars that must not leak from the calling job (e.g. a ccl session) into new jobs.
+clean_env_args() {
+  local v; for v in $(compgen -e); do
+    case "$v" in
+      SLURM_*|SBATCH_*|SALLOC_*|SRUN_*|CUDA_VISIBLE_DEVICES|ANTHROPIC_*|CCL_*|CLAUDE_CODE_*) printf -- '-u\n%s\n' "$v" ;;
+    esac
+  done
+}
+
+ssh_alive() { ssh "${SSH_OPTS[@]}" -O check "$TARGET" >/dev/null 2>&1; }
+
+# remote_sh: run the bash script on stdin on Engaging. Never prompts.
+remote_sh() {
+  if [[ -n "$ENG_SSH_CMD" ]]; then
+    # shellcheck disable=SC2086
+    $ENG_SSH_CMD bash -s -- "$@"
+    return
+  fi
+  if [[ "$ENG_MODE" == local ]]; then
+    local -a unset_args=(); mapfile -t unset_args < <(clean_env_args)
+    env "${unset_args[@]}" bash -s -- "$@"
+    return
+  fi
+  ssh_alive || die "no live SSH connection to $TARGET. Run 'eng connect' in your own terminal first (needs Duo)."
+  ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o ControlMaster=no "$TARGET" bash -l -s -- "$@"
+}
+
+# remote_cmd "string": run a shell string on Engaging.
+remote_cmd() { printf '%s\n' "$1" | remote_sh; }
+
+# Turn "~/x" into "$HOME/x" so it expands inside double quotes remotely.
+home_expand() {
+  local p="$1"
+  if [[ "$p" == "~" ]]; then printf '%s' '$HOME'
+  elif [[ "$p" == "~/"* ]]; then printf '%s' "\$HOME/${p#\~/}"
+  else printf '%s' "$p"; fi
+}
+
+# Quote a value for safe inclusion in a remote bash script.
+q() { printf '%q' "$1"; }
+
+# ----------------------------------------------------------------------------
+# Connection management
+# ----------------------------------------------------------------------------
+cmd_connect() {
+  if [[ "$ENG_MODE" == local ]]; then info "Local mode (Slurm is on this machine): no connection needed."; return; fi
+  mkdir -p "$HOME/.ssh"
+  if ssh "${SSH_OPTS[@]}" -O check "$TARGET" >/dev/null 2>&1; then
+    info "Already connected to $TARGET."; return
+  fi
+  info "Opening master connection to $TARGET (complete password + Duo below)..."
+  ssh "${SSH_OPTS[@]}" -o ControlMaster=yes -o "ControlPersist=${ENG_CONTROL_PERSIST}" \
+      -fN "$TARGET"
+  info "Connected. Connection persists for ${ENG_CONTROL_PERSIST} of idle time."
+}
+
+cmd_disconnect() {
+  if [[ "$ENG_MODE" == local ]]; then info "Local mode: nothing to disconnect."; return; fi
+  ssh "${SSH_OPTS[@]}" -O exit "$TARGET" 2>/dev/null && info "Disconnected." || info "No connection open."
+}
+
+cmd_check() {
+  if [[ "$ENG_MODE" == ssh && -z "$ENG_SSH_CMD" ]] && ! ssh_alive; then
+    echo "DISCONNECTED: run 'eng connect' in a terminal (needs Duo)."; exit 2
+  fi
+  remote_cmd "echo \"CONNECTED ($ENG_MODE mode): \$(whoami)@\$(hostname)  \$(date)\"; command -v sbatch >/dev/null || echo 'warning: sbatch not found'"
+}
+
+# ----------------------------------------------------------------------------
+# Resource option parsing (shared by submit / srun / interactive)
+# ----------------------------------------------------------------------------
+reset_opts() {
+  O_PARTITION=""; O_CPUS=""; O_MEM=""; O_MEM_PER_CPU=""; O_GPUS=0; O_GPU_TYPE=""
+  O_TIME=""; O_NODES=""; O_NTASKS=""; O_NTASKS_PER_NODE=""; O_NAME=""; O_ARRAY=""
+  O_CONSTRAINT=""; O_EXCLUSIVE=0; O_DEPENDENCY=""; O_MAIL=""; O_ACCOUNT="$ENG_ACCOUNT"
+  O_QOS=""; O_MODULES=(); O_CONDA=""; O_VENV=""; O_WORKDIR=""; O_ENVS=(); O_DRY=0
+  O_REQUEUE=0; O_EXTRA=(); O_SETUP=(); O_PREEMPT=0; O_TEST=0; O_NODELIST=""; O_EXCLUDE=""
+  CMD_ARGS=()
+}
+
+usage_resources() {
+  cat <<'EOF'
+Resource options:
+  -p, --partition P        SLURM partition (default: CPU or GPU partition from config)
+      --preemptable        use the preemptable partition (longer/more resources, may be killed)
+      --test               use the quick-test partition (short debug jobs)
+  -c, --cpus N             CPUs per task         (default 1; GPU jobs: CCL_CPUS_PER_GPU x GPUs)
+  -m, --mem SIZE           memory per node, 16G  (default 4G; GPU jobs: CCL_MEM_PER_GPU x GPUs)
+      --mem-per-cpu SIZE   memory per CPU instead of per node
+  -g, --gpus N             number of GPUs (implies GPU partition)
+      --gpu-type T         l40s, h100, h200, b200 (see `eng gpus`; default ENG_GPU_TYPE=any)
+  -t, --time T             walltime, e.g. 30:00, 4:00:00, 2-00:00:00 (default 1:00:00)
+  -N, --nodes N            number of nodes
+  -n, --ntasks N           number of tasks (MPI ranks)
+      --ntasks-per-node N
+  -J, --name NAME          job name (default: eng)
+  -a, --array SPEC         job array, e.g. 0-99 or 1-50%10  (use $SLURM_ARRAY_TASK_ID)
+      --constraint C       node feature constraint
+      --nodelist L / --exclude L
+      --exclusive          whole node(s)
+  -d, --after JOBID[:..]   start after job(s) finish successfully (afterok)
+      --dependency SPEC    raw --dependency spec (afterany:123, etc.)
+      --mail TYPE          e.g. END,FAIL (mails your MIT address)
+  -A, --account A / --qos Q
+      --requeue            allow requeue (useful on preemptable)
+  -M, --module MOD         module to load (repeatable), e.g. -M miniforge -M cuda/12.4.0
+      --conda ENV          `conda activate ENV` (loads miniforge if no module given)
+      --venv PATH          `source PATH/bin/activate`
+      --setup 'CMD'        extra shell line(s) run before the command (repeatable)
+  -C, --workdir DIR        job working dir (default: current dir locally, ~ over ssh)
+  -e, --env K=V            export env var in the job (repeatable)
+      --sbatch-opt OPT     raw extra sbatch option, e.g. --sbatch-opt=--signal=USR1@60
+      --dry-run            print the generated script / command, don't submit
+EOF
+}
+
+parse_opts() {
+  reset_opts
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --) shift; CMD_ARGS=("$@"); break ;;
+      -p|--partition) O_PARTITION="$2"; shift 2 ;;
+      --preemptable|--preemptible) O_PREEMPT=1; shift ;;
+      --test|--quicktest) O_TEST=1; shift ;;
+      -c|--cpus|--cpus-per-task) O_CPUS="$2"; shift 2 ;;
+      -m|--mem) O_MEM="$2"; shift 2 ;;
+      --mem-per-cpu) O_MEM_PER_CPU="$2"; shift 2 ;;
+      -g|--gpus|--gpu) O_GPUS="$2"; shift 2 ;;
+      --gpu-type) O_GPU_TYPE="$2"; shift 2 ;;
+      -t|--time) O_TIME="$2"; shift 2 ;;
+      -N|--nodes) O_NODES="$2"; shift 2 ;;
+      -n|--ntasks) O_NTASKS="$2"; shift 2 ;;
+      --ntasks-per-node) O_NTASKS_PER_NODE="$2"; shift 2 ;;
+      -J|--name|--job-name) O_NAME="$2"; shift 2 ;;
+      -a|--array) O_ARRAY="$2"; shift 2 ;;
+      --constraint) O_CONSTRAINT="$2"; shift 2 ;;
+      --nodelist|-w) O_NODELIST="$2"; shift 2 ;;
+      --exclude|-x) O_EXCLUDE="$2"; shift 2 ;;
+      --exclusive) O_EXCLUSIVE=1; shift ;;
+      -d|--after) O_DEPENDENCY="afterok:$2"; shift 2 ;;
+      --dependency) O_DEPENDENCY="$2"; shift 2 ;;
+      --mail) O_MAIL="$2"; shift 2 ;;
+      -A|--account) O_ACCOUNT="$2"; shift 2 ;;
+      --qos) O_QOS="$2"; shift 2 ;;
+      --requeue) O_REQUEUE=1; shift ;;
+      -M|--module) O_MODULES+=("$2"); shift 2 ;;
+      --conda) O_CONDA="$2"; shift 2 ;;
+      --venv) O_VENV="$2"; shift 2 ;;
+      --setup) O_SETUP+=("$2"); shift 2 ;;
+      -C|--workdir|--chdir) O_WORKDIR="$2"; shift 2 ;;
+      -e|--env) O_ENVS+=("$2"); shift 2 ;;
+      --sbatch-opt=*) O_EXTRA+=("${1#--sbatch-opt=}"); shift ;;
+      --sbatch-opt) O_EXTRA+=("$2"); shift 2 ;;
+      --dry-run) O_DRY=1; shift ;;
+      --*=*) local k="${1%%=*}" v="${1#*=}"; shift; set -- "$k" "$v" "$@" ;;
+      -h|--help) return 10 ;;
+      *) CMD_ARGS=("$@"); break ;;
+    esac
+  done
+
+  [[ "$O_GPUS" =~ ^[0-9]+$ ]] || die "--gpus must be an integer"
+  if [[ -z "$O_PARTITION" ]]; then
+    if   (( O_TEST ));    then O_PARTITION="$ENG_TEST_PARTITION"
+    elif (( O_PREEMPT )); then O_PARTITION="$ENG_PREEMPT_PARTITION"
+    elif (( O_GPUS > 0 )); then O_PARTITION="$ENG_GPU_PARTITION"
+    else O_PARTITION="$ENG_CPU_PARTITION"; fi
+  fi
+  [[ "$O_GPU_TYPE" == any ]] && O_GPU_TYPE=""
+  if [[ -n "$O_GPU_TYPE" ]] && (( O_GPUS == 0 )); then O_GPUS=1; fi
+  if (( O_GPUS > 0 )); then
+    : "${O_GPU_TYPE:=${ENG_GPU_TYPE/#any/}}"
+    local num="${CCL_MEM_PER_GPU%%[!0-9]*}" unit="${CCL_MEM_PER_GPU##*[0-9]}"
+    : "${O_CPUS:=$(( O_GPUS * CCL_CPUS_PER_GPU ))}"
+    [[ -n "$O_MEM_PER_CPU" ]] || : "${O_MEM:=$(( O_GPUS * num ))${unit:-G}}"
+  else
+    : "${O_CPUS:=1}"; [[ -n "$O_MEM_PER_CPU" ]] || : "${O_MEM:=4G}"
+  fi
+  : "${O_TIME:=1:00:00}"
+  : "${O_NAME:=eng}"
+  : "${O_WORKDIR:=$ENG_WORKDIR}"
+  return 0
+}
+
+# "D-HH:MM:SS" | "HH:MM:SS" | "MM:SS" | "MM" -> seconds
+time_secs() {
+  local t="$1" d=0 h=0 m=0 sec=0
+  if [[ "$t" == *-* ]]; then d="${t%%-*}"; t="${t#*-}"
+    IFS=: read -r h m sec <<<"$t"
+  else
+    local -a p; IFS=: read -r -a p <<<"$t"
+    case ${#p[@]} in 1) m=${p[0]} ;; 2) m=${p[0]}; sec=${p[1]} ;; *) h=${p[0]}; m=${p[1]}; sec=${p[2]} ;; esac
+  fi
+  echo $(( 10#${d:-0}*86400 + 10#${h:-0}*3600 + 10#${m:-0}*60 + 10#${sec:-0} ))
+}
+
+# Warn (don't block) when a request exceeds the known per-user limits of the
+# normal partitions; Slurm would otherwise just leave it pending or reject it.
+check_limits() {
+  [[ "$O_PARTITION" == "$ENG_PREEMPT_PARTITION" ]] && return 0
+  local secs gpus=$O_GPUS; secs="$(time_secs "$O_TIME")"
+  [[ -n "$O_NODES" && "$O_NODES" =~ ^[0-9]+$ ]] && gpus=$(( gpus * O_NODES ))
+  if [[ "$O_PARTITION" == "$ENG_GPU_PARTITION" ]]; then
+    (( gpus > ENG_MAX_GPUS )) && warn "$gpus GPUs > per-user cap of $ENG_MAX_GPUS on $O_PARTITION; it will pend forever. Use --preemptable or fewer GPUs."
+    (( secs > $(time_secs "$ENG_GPU_MAX_TIME") )) && warn "time $O_TIME > $ENG_GPU_MAX_TIME limit of $O_PARTITION; use --preemptable --requeue (and checkpoint)."
+    if [[ -n "${CCL_ACTIVE:-}" ]] && (( gpus > 0 )); then
+      warn "this ccl session already holds GPUs, which count toward the $ENG_MAX_GPUS-GPU cap; the job may pend until it ends (try --preemptable)."
+    fi
+  fi
+  if [[ "$O_PARTITION" == "$ENG_CPU_PARTITION" ]] && (( secs > $(time_secs "$ENG_CPU_MAX_TIME") )); then
+    warn "time $O_TIME > $ENG_CPU_MAX_TIME limit of $O_PARTITION; use --preemptable or split the work."
+  fi
+  return 0
+}
+
+# Emit SLURM options one per line (without "#SBATCH ").
+slurm_flags() {
+  echo "--job-name=$O_NAME"
+  echo "--partition=$O_PARTITION"
+  echo "--time=$O_TIME"
+  echo "--cpus-per-task=$O_CPUS"
+  if [[ -n "$O_MEM_PER_CPU" ]]; then echo "--mem-per-cpu=$O_MEM_PER_CPU"; else echo "--mem=$O_MEM"; fi
+  if (( O_GPUS > 0 )); then echo "--gres=gpu:${O_GPU_TYPE:+$O_GPU_TYPE:}$O_GPUS"; fi
+  [[ -n "$O_NODES" ]]            && echo "--nodes=$O_NODES"
+  [[ -n "$O_NTASKS" ]]           && echo "--ntasks=$O_NTASKS"
+  [[ -n "$O_NTASKS_PER_NODE" ]]  && echo "--ntasks-per-node=$O_NTASKS_PER_NODE"
+  [[ -n "$O_ARRAY" ]]            && echo "--array=$O_ARRAY"
+  [[ -n "$O_CONSTRAINT" ]]       && echo "--constraint=$O_CONSTRAINT"
+  [[ -n "$O_NODELIST" ]]         && echo "--nodelist=$O_NODELIST"
+  [[ -n "$O_EXCLUDE" ]]          && echo "--exclude=$O_EXCLUDE"
+  (( O_EXCLUSIVE ))              && echo "--exclusive"
+  [[ -n "$O_DEPENDENCY" ]]       && echo "--dependency=$O_DEPENDENCY"
+  [[ -n "$O_MAIL" ]]             && echo "--mail-type=$O_MAIL"
+  [[ -n "$O_ACCOUNT" ]]          && echo "--account=$O_ACCOUNT"
+  [[ -n "$O_QOS" ]]              && echo "--qos=$O_QOS"
+  (( O_REQUEUE ))                && echo "--requeue"
+  local x; for x in "${O_EXTRA[@]+"${O_EXTRA[@]}"}"; do echo "$x"; done
+  return 0
+}
+
+# The user's command as a single shell string.
+user_command() {
+  if (( ${#CMD_ARGS[@]} == 0 )); then die "no command given (put it after --)"; fi
+  # Args are joined with spaces (like ssh), so $SLURM_ARRAY_TASK_ID, pipes,
+  # && etc. are interpreted by the job shell. Quote accordingly.
+  printf '%s' "${CMD_ARGS[*]}"
+}
+
+# Environment preamble (modules, conda, venv, env vars, cd).
+job_preamble() {
+  local m mods=()
+  # shellcheck disable=SC2206
+  [[ -n "$ENG_DEFAULT_MODULES" ]] && mods=($ENG_DEFAULT_MODULES)
+  mods+=("${O_MODULES[@]+"${O_MODULES[@]}"}")
+  if [[ -n "$O_CONDA" && ${#mods[@]} -eq 0 ]]; then mods=(miniforge); fi
+  for m in "${mods[@]+"${mods[@]}"}"; do echo "module load $(q "$m")"; done
+  [[ -n "$O_CONDA" ]] && { echo 'eval "$(conda shell.bash hook)"'; echo "conda activate $(q "$O_CONDA")"; }
+  [[ -n "$O_VENV" ]]  && echo "source \"$(home_expand "$O_VENV")/bin/activate\""
+  local e; for e in "${O_ENVS[@]+"${O_ENVS[@]}"}"; do
+    [[ "$e" == *=* ]] || die "--env expects KEY=VALUE, got '$e'"
+    echo "export ${e%%=*}=$(q "${e#*=}")"
+  done
+  local s; for s in "${O_SETUP[@]+"${O_SETUP[@]}"}"; do echo "$s"; done
+  echo "cd \"$(home_expand "$O_WORKDIR")\""
+}
+
+build_sbatch_script() {
+  local cmd; cmd="$(user_command)"
+  echo "#!/bin/bash"
+  slurm_flags | sed 's/^/#SBATCH /'
+  cat <<'EOF'
+set -eo pipefail
+echo "== job $SLURM_JOB_ID${SLURM_ARRAY_TASK_ID:+ (array task $SLURM_ARRAY_TASK_ID)} on $(hostname) at $(date)"
+echo "== partition=$SLURM_JOB_PARTITION cpus=${SLURM_CPUS_PER_TASK:-?} gpus=${CUDA_VISIBLE_DEVICES:-none}"
+EOF
+  job_preamble
+  (( O_GPUS > 0 )) && echo 'command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true'
+  echo "echo \"== running: \"$(q "$cmd")"
+  echo "set +e"
+  printf '(\n%s\n)\n' "$cmd"
+  echo 'status=$?'
+  echo 'echo "== finished at $(date) with exit code $status"'
+  echo 'exit $status'
+}
+
+# ----------------------------------------------------------------------------
+# Job submission
+# ----------------------------------------------------------------------------
+cmd_submit() {
+  parse_opts "$@" || { [[ $? == 10 ]] && { echo "Usage: eng submit [options] -- <command>"; usage_resources; return 0; }; }
+  check_limits
+  local script; script="$(build_sbatch_script)"
+  if (( O_DRY )); then echo "$script"; return 0; fi
+  submit_script_text "$script" "$O_NAME" "$([[ -n "$O_ARRAY" ]] && echo 1 || echo 0)"
+}
+
+# submit_script_text <script> <name> <is_array>
+submit_script_text() {
+  local script="$1" name="$2" is_array="$3"
+  local pattern='%x-%j.out'; [[ "$is_array" == 1 ]] && pattern='%x-%A_%a.out'
+  local delim="ENG_SBATCH_EOF_$$_$RANDOM"
+  local logdir jobdir; logdir="$(home_expand "$ENG_LOG_DIR")"; jobdir="$(home_expand "$ENG_JOB_DIR")"
+  local out
+  out="$(remote_sh <<EOF
+set -e
+LOGDIR="$logdir"; JOBDIR="$jobdir"
+mkdir -p "\$LOGDIR" "\$JOBDIR"
+F="\$JOBDIR/\$(date +%Y%m%d-%H%M%S)-$(q "$name")-\$\$.sbatch"
+cat > "\$F" <<'$delim'
+$script
+$delim
+ID=\$(sbatch --parsable --output="\$LOGDIR/$pattern" "\$F")
+echo "\$ID \$F \$LOGDIR"
+EOF
+)"
+  local id file ldir; read -r id file ldir <<<"$out"
+  [[ -n "$id" ]] || die "submission failed: $out"
+  id="${id%%;*}"
+  echo "Submitted job $id"
+  echo "  script: $file"
+  echo "  log:    $ldir/${pattern//%x/$name}" | sed "s/%j/$id/; s/%A/$id/"
+  echo "  watch:  eng status $id | eng logs $id | eng wait $id"
+}
+
+# Submit an existing local sbatch script (copied up) or a remote path.
+cmd_sbatch() {
+  local remote=0 extra=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --remote) remote=1; shift ;;
+      --) shift; break ;;
+      -*) extra+=("$1"); shift ;;
+      *) break ;;
+    esac
+  done
+  local f="${1:-}"; [[ -n "$f" ]] || die "usage: eng sbatch [--remote] [sbatch-opts] <script> [args...]"; shift
+  local qargs="" a; for a in "$@"; do qargs+=" $(q "$a")"; done
+  local qextra="" ; for a in "${extra[@]+"${extra[@]}"}"; do qextra+=" $(q "$a")"; done
+  if (( remote )) || [[ "$ENG_MODE" == local ]]; then
+    # Already on the cluster: submit in place (relative paths resolve from here).
+    remote_cmd "sbatch$qextra \"$(home_expand "$f")\"$qargs"
+  else
+    [[ -f "$f" ]] || die "no such local file: $f"
+    local delim="ENG_SBATCH_EOF_$$_$RANDOM" jobdir; jobdir="$(home_expand "$ENG_JOB_DIR")"
+    remote_sh <<EOF
+set -e
+mkdir -p "$jobdir"
+F="$jobdir/\$(date +%Y%m%d-%H%M%S)-$(q "$(basename "$f")")"
+cat > "\$F" <<'$delim'
+$(cat "$f")
+$delim
+cd "$(home_expand "$ENG_WORKDIR")"
+sbatch$qextra "\$F"$qargs
+echo "  script copied to: \$F"
+EOF
+  fi
+}
+
+# Run a command synchronously on a compute node (blocking srun).
+cmd_srun() {
+  parse_opts "$@" || { [[ $? == 10 ]] && { echo "Usage: eng srun [options] -- <command>"; usage_resources; return 0; }; }
+  local flags; flags="$(slurm_flags | grep -v -e '^--array' -e '^--mail' -e '^--requeue' | while read -r l; do printf '%s ' "$(q "$l")"; done)"
+  check_limits
+  local body; body="$(job_preamble; user_command)"
+  local payload="srun $flags bash -lc $(q "$body")"
+  if (( O_DRY )); then echo "$payload"; return 0; fi
+  info "Waiting for allocation on $O_PARTITION (blocks until the command finishes)..."
+  remote_cmd "$payload"
+}
+
+# Print an salloc command for the human to run for an interactive shell.
+cmd_interactive() {
+  parse_opts "$@" || { [[ $? == 10 ]] && { echo "Usage: eng interactive [options]"; usage_resources; return 0; }; }
+  local flags; flags="$(slurm_flags | grep -v -e '^--array' -e '^--mail' -e '^--job-name' | tr '\n' ' ')"
+  echo "Interactive sessions need a real terminal; run this yourself:"
+  echo
+  if [[ "$ENG_MODE" == ssh ]]; then
+    echo "  ssh -t -o ControlPath=$ENG_CONTROL_PATH $TARGET salloc $flags"
+    echo
+    echo "(or once on the login node:  salloc $flags)"
+  else
+    echo "  salloc $flags"
+    echo
+    echo "(from a login node shell, not from inside an existing job)"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Monitoring
+# ----------------------------------------------------------------------------
+SQ_FMT='%.12i %.9P %.24j %.8T %.10M %.10l %.4C %.8m %.14b %.6D %R'
+
+cmd_status() {
+  if [[ $# -eq 0 ]]; then
+    remote_cmd "squeue --me -o $(q "$SQ_FMT")"
+  else
+    local id; for id in "$@"; do
+      remote_cmd "
+if squeue -h -j $(q "$id") 2>/dev/null | grep -q .; then
+  squeue -j $(q "$id") -o $(q "$SQ_FMT")
+  echo; echo '-- estimated start (pending jobs):'; squeue --start -h -j $(q "$id") -o '%.12i %.20S %R' 2>/dev/null || true
+else
+  sacct -j $(q "$id") -o JobID%18,JobName%20,Partition,State,ExitCode,Elapsed,AllocCPUS,MaxRSS,ReqTRES%40,NodeList
+fi"
+    done
+  fi
+}
+
+cmd_history() {
+  local days=7 all=""
+  while [[ $# -gt 0 ]]; do case "$1" in
+    --days) days="$2"; shift 2 ;; --steps) all=1; shift ;; *) die "unknown option $1" ;; esac; done
+  local x="-X"; [[ -n "$all" ]] && x=""
+  remote_cmd "sacct $x -S now-${days}days -o JobID%18,JobName%22,Partition%14,State%12,ExitCode,Elapsed,AllocCPUS,ReqMem,AllocTRES%40"
+}
+
+cmd_logs() {
+  local follow=0 lines=100 err=0
+  while [[ $# -gt 0 ]]; do case "$1" in
+    -f|--follow) follow=1; shift ;; -n|--lines) lines="$2"; shift 2 ;; --err) err=1; shift ;;
+    --all) lines=all; shift ;; *) break ;; esac; done
+  local id="${1:-}"; [[ -n "$id" ]] || die "usage: eng logs [-f] [-n N|--all] [--err] <jobid>"
+  local key=StdOut; (( err )) && key=StdErr
+  local tailcmd="tail -n $(q "$lines")"; [[ "$lines" == all ]] && tailcmd="cat"
+  (( follow )) && tailcmd="tail -n 50 -F --pid=\$WAITPID"
+  remote_cmd "
+id=$(q "$id"); LOGDIR=\"$(home_expand "$ENG_LOG_DIR")\"
+f=\$(scontrol show job \"\$id\" 2>/dev/null | grep -oP '$key=\K\S+' | head -1)
+if [[ -z \"\$f\" || ! -f \"\$f\" ]]; then
+  f=\$(ls -t \"\$LOGDIR\"/*-\"\$id\".out \"\$LOGDIR\"/*-\"\$id\"_*.out 2>/dev/null | head -1)
+fi
+[[ -n \"\$f\" && -f \"\$f\" ]] || { echo \"no log found for job \$id (pending, or not submitted via eng?)\" >&2; exit 1; }
+echo \"==> \$f\" >&2
+if [[ $follow == 1 ]]; then
+  ( while squeue -h -j \"\$id\" 2>/dev/null | grep -q .; do sleep 10; done ) & WAITPID=\$!
+fi
+$tailcmd \"\$f\""
+}
+
+# Block until job(s) leave the queue, then print the final accounting state.
+cmd_wait() {
+  local interval=30 timeout=0
+  while [[ $# -gt 0 ]]; do case "$1" in
+    -i|--interval) interval="$2"; shift 2 ;; --timeout) timeout="$2"; shift 2 ;; *) break ;; esac; done
+  [[ $# -gt 0 ]] || die "usage: eng wait [-i SECONDS] [--timeout SECONDS] <jobid>..."
+  local ids; ids="$(IFS=,; echo "$*")"
+  local start=$SECONDS last=""
+  while :; do
+    local st; st="$(remote_cmd "squeue -h -j $(q "$ids") -o '%i %T %R' 2>/dev/null || true")"
+    [[ -z "$st" ]] && break
+    local summary; summary="$(awk '{print $2}' <<<"$st" | sort | uniq -c | awk '{printf "%s=%s ", $2, $1}')"
+    if [[ "$summary" != "$last" ]]; then info "[$(date +%H:%M:%S)] $summary"; last="$summary"; fi
+    if (( timeout > 0 && SECONDS - start >= timeout )); then info "timeout; still queued/running"; return 3; fi
+    sleep "$interval"
+  done
+  local out; out="$(remote_cmd "sacct -X -n -P -j $(q "$ids") -o JobID,JobName,State,ExitCode,Elapsed")"
+  echo "JobID|Name|State|ExitCode|Elapsed"; echo "$out"
+  if grep -qvE '\|COMPLETED\|' <<<"$out"; then return 1; fi
+}
+
+cmd_cancel() {
+  [[ $# -gt 0 ]] || die "usage: eng cancel <jobid>... | --all | --pending | --name NAME  [--force]"
+  local force=0 a args=(); for a in "$@"; do if [[ "$a" == --force ]]; then force=1; else args+=("$a"); fi; done
+  set -- "${args[@]+"${args[@]}"}"
+  [[ $# -gt 0 ]] || die "nothing to cancel"
+  # The job this shell runs in (e.g. the ccl session hosting Claude Code) and ccl's
+  # own jobs are protected: cancelling them would kill the session or its model server.
+  local self="${SLURM_JOB_ID:-}" filter=""
+  case "$1" in
+    --all)     filter="" ;;
+    --pending) filter="-t PENDING" ;;
+    --name)    [[ -n "${2:-}" ]] || die "--name needs a value"; filter="-n $(q "$2")" ;;
+    *)
+      local ids="" id
+      for id in "$@"; do
+        if (( ! force )) && [[ -n "$self" && "${id%%_*}" == "$self" ]]; then
+          die "refusing to cancel job $id: it is the job this session runs in (use --force, or 'ccl stop')"
+        fi
+        ids+=" $(q "$id")"
+      done
+      remote_cmd "scancel$ids && echo cancelled:$ids"; return ;;
+  esac
+  local keep=""; (( force )) || keep="$self"
+  remote_cmd "KEEP=$(q "$keep"); FORCE=$force; FILTER=$(q "$filter")
+$(cat <<'BODY'
+ids=$(squeue --me -h $FILTER -o '%i %j' | while read -r id name; do
+  base=${id%%_*}
+  if [[ $FORCE == 0 && ( $base == "$KEEP" || $name =~ ^ccl(-serve|-batch)?$ ) ]]; then
+    echo "skipping $id ($name)" >&2; continue
+  fi
+  echo "$id"
+done | sort -u)
+[[ -n "$ids" ]] || { echo "nothing to cancel"; exit 0; }
+scancel $ids && echo cancelled: $ids
+BODY
+)"
+}
+
+# Modify a job: more/less time, different partition, hold/release, etc.
+cmd_update() {
+  local id="${1:-}"; shift || true
+  [[ -n "$id" && $# -gt 0 ]] || die "usage: eng update <jobid> [--time T] [--partition P] [--cpus N] [--mem M] [--gpus N[:type]] [--name N] [--hold|--release] [--array-limit N]"
+  local kv=() action=""
+  while [[ $# -gt 0 ]]; do case "$1" in
+    -t|--time) kv+=("TimeLimit=$2"); shift 2 ;;
+    -p|--partition) kv+=("Partition=$2"); shift 2 ;;
+    -c|--cpus) kv+=("NumCPUs=$2"); shift 2 ;;
+    -m|--mem) kv+=("MinMemoryNode=$2"); shift 2 ;;
+    -g|--gpus) kv+=("TRES=gres/gpu=$2"); shift 2 ;;
+    -J|--name) kv+=("JobName=$2"); shift 2 ;;
+    --array-limit) kv+=("ArrayTaskThrottle=$2"); shift 2 ;;
+    --nice) kv+=("Nice=$2"); shift 2 ;;
+    --hold) action=hold; shift ;; --release) action=release; shift ;; --requeue) action=requeue; shift ;;
+    *) die "unknown update option $1" ;; esac; done
+  if [[ -n "$action" ]]; then remote_cmd "scontrol $action $(q "$id") && echo $action: $(q "$id")"; fi
+  if (( ${#kv[@]} )); then
+    local s="" x; for x in "${kv[@]}"; do s+=" $(q "$x")"; done
+    remote_cmd "scontrol update JobId=$(q "$id")$s && echo updated $(q "$id"):$s"
+    info "Note: users can usually only change PENDING jobs, and can only lower the time limit of running ones."
+  fi
+}
+
+cmd_efficiency() {
+  [[ $# -gt 0 ]] || die "usage: eng efficiency <jobid>"
+  remote_cmd "if command -v seff >/dev/null; then seff $(q "$1"); else sacct -j $(q "$1") -o JobID,State,Elapsed,TotalCPU,AllocCPUS,MaxRSS,ReqMem; fi"
+}
+
+# ----------------------------------------------------------------------------
+# Cluster info / compute discovery
+# ----------------------------------------------------------------------------
+cmd_partitions() {
+  remote_cmd "
+echo '== Partitions you can see (avail/idle nodes, limits)'
+sinfo -s -o '%.20P %.6a %.12l %.16F %.8c %.10m %.30G'
+echo
+echo '   NODES(A/I/O/T) = allocated/idle/other/total'"
+}
+
+cmd_resources() {
+  local part="${1:-}"
+  remote_cmd "
+sinfo ${part:+-p $(q "$part")} -N -o '%.14N %.16P %.8T %.10C %.8m %.10e %.30G' | awk 'NR==1 || \$4 !~ /down|drain/'
+echo
+echo 'CPUS(A/I/O/T) = allocated/idle/other/total; FREE_MEM in MB'"
+}
+
+cmd_gpus() {
+  remote_cmd "
+echo '== GPU types by partition (node count, gres, state)'
+sinfo -h -o '%P|%G|%T|%D' | grep -i gpu | awk -F'|' '{k=\$1\"|\"\$2\"|\"\$3; n[k]+=\$4} END {for (k in n) {split(k,a,\"|\"); printf \"%-18s %-32s %-10s %4d nodes\n\", a[1], a[2], a[3], n[k]}}' | sort
+echo
+echo '== GPUs currently in use by partition'
+squeue -h -t R -o '%P %b' | grep -i gpu | awk '{split(\$2,a,\":\"); c[\$1]+=a[length(a)]} END {for (p in c) printf \"%-18s %d GPUs allocated\n\", p, c[p]}' || true"
+}
+
+cmd_limits() {
+  remote_cmd "
+echo '== Your associations (accounts / partitions / QOS)'
+sacctmgr -n -P show assoc user=\"\$USER\" format=Account,Partition,QOS,GrpTRES,MaxTRES,MaxWall,MaxJobs,MaxSubmit 2>/dev/null | column -t -s'|' || true
+echo
+echo '== QOS limits'
+sacctmgr -n -P show qos format=Name,MaxWall,MaxTRESPU%40,MaxJobsPU,MaxSubmitPU,GrpTRES 2>/dev/null | column -t -s'|' || true
+echo
+echo '== Partition time limits'
+sinfo -h -o '%P %l' | sort -u"
+}
+
+cmd_quota() {
+  remote_cmd '
+echo "== Storage"
+for d in "$HOME" /home/$USER /orcd/data/* /orcd/pool/* /orcd/scratch/*/$USER /pool001/$USER /nobackup1/$USER; do
+  [[ -d "$d" && -O "$d" || -d "$d" && -w "$d" ]] && df -h "$d" 2>/dev/null | tail -1 | awk -v d="$d" "{printf \"%-40s size=%s used=%s avail=%s (%s)\n\", d, \$2, \$3, \$4, \$5}"
+done | sort -u
+command -v quota >/dev/null && { echo; quota -s 2>/dev/null || true; }'
+}
+
+cmd_modules() {
+  local pat="${1:-}"
+  remote_cmd "type module >/dev/null 2>&1 || source /etc/profile >/dev/null 2>&1
+module -t avail ${pat:+$(q "$pat")} 2>&1 | grep -v ':\$' | sort -u | head -200"
+}
+
+# ----------------------------------------------------------------------------
+# Remote shell + file transfer
+# ----------------------------------------------------------------------------
+cmd_run() {
+  [[ $# -gt 0 ]] || die "usage: eng run '<command>'   (runs on the LOGIN node — keep it light)"
+  if [[ $# -eq 1 ]]; then remote_cmd "$1"; else local s="" a; for a in "$@"; do s+="$(q "$a") "; done; remote_cmd "$s"; fi
+}
+
+need_ssh_mode() {
+  [[ "$ENG_MODE" == ssh ]] || die "push/pull are for ssh mode (you're already on the cluster; use cp/rsync)"
+}
+
+rsync_e() {
+  if [[ -n "$ENG_SSH_CMD" ]]; then die "push/pull unsupported with ENG_SSH_CMD"; fi
+  printf 'ssh -o ControlPath=%s -o BatchMode=yes -o ControlMaster=no' "$ENG_CONTROL_PATH"
+}
+
+cmd_push() {
+  need_ssh_mode
+  local excl=(--exclude .git --exclude __pycache__ --exclude .venv --exclude node_modules --exclude '*.pyc')
+  [[ $# -ge 1 ]] || die "usage: eng push <local-path> [remote-path]  (default remote: ENG_WORKDIR or ~)"
+  local src="$1" dst="${2:-$ENG_WORKDIR}"
+  rsync -az --info=stats1,progress2 "${excl[@]}" -e "$(rsync_e)" "$src" "$TARGET:$dst"
+}
+
+cmd_pull() {
+  need_ssh_mode
+  [[ $# -ge 1 ]] || die "usage: eng pull <remote-path> [local-path]"
+  rsync -az --info=stats1,progress2 -e "$(rsync_e)" "$TARGET:$1" "${2:-.}"
+}
+
+cmd_config() {
+  cat <<EOF
+mode                  $ENG_MODE   (ENG_MODE=auto picks local when sbatch exists)
+config                $CCL_REPO/lib/common.sh + $CCL_REPO/config.local.sh $([[ -f $CCL_REPO/config.local.sh ]] && echo "(found)" || echo "(not found)")
+ENG_CPU_PARTITION     $ENG_CPU_PARTITION   (max time $ENG_CPU_MAX_TIME)
+ENG_GPU_PARTITION     $ENG_GPU_PARTITION   (max time $ENG_GPU_MAX_TIME, $ENG_MAX_GPUS GPUs/user)
+ENG_PREEMPT_PARTITION $ENG_PREEMPT_PARTITION
+ENG_TEST_PARTITION    $ENG_TEST_PARTITION
+ENG_GPU_TYPE          $ENG_GPU_TYPE
+GPU job defaults      $CCL_CPUS_PER_GPU CPUs + $CCL_MEM_PER_GPU per GPU (CCL_CPUS_PER_GPU / CCL_MEM_PER_GPU)
+ENG_WORKDIR           $ENG_WORKDIR
+ENG_LOG_DIR           $ENG_LOG_DIR
+ENG_JOB_DIR           $ENG_JOB_DIR
+ENG_ACCOUNT           ${ENG_ACCOUNT:-(none)}
+ENG_DEFAULT_MODULES   ${ENG_DEFAULT_MODULES:-(none)}
+ssh target            $TARGET  (ENG_USER / ENG_HOST; ssh mode only)
+EOF
+}
+
+usage() {
+  cat <<'EOF'
+eng: run Slurm jobs on MIT Engaging (directly on the cluster, or over SSH from a laptop)
+
+Connection
+  eng check                   verify Slurm is reachable (shows local or ssh mode)
+  eng connect                 ssh mode only: open the master connection (YOU run it; password + Duo)
+  eng disconnect
+
+Run jobs
+  eng submit [res] -- CMD     batch job (CPU by default; -g N for GPUs); prints job id
+  eng sbatch [--remote] FILE  submit an existing sbatch script (ssh mode: local file copied up)
+  eng srun [res] -- CMD       run CMD on a compute node and wait for output (short jobs)
+  eng interactive [res]       print the salloc command for an interactive shell
+  eng run 'CMD'               run CMD here (local) or on the login node (ssh); light work only
+
+Monitor / control
+  eng status [JOBID]          your queue, or details/accounting for one job
+  eng logs [-f] [-n N] JOBID  show (or follow) a job's output
+  eng wait [-i S] JOBID...    block until job(s) finish; nonzero exit if any failed
+  eng history [--days N]      recent jobs from sacct
+  eng efficiency JOBID        CPU/memory efficiency (seff)
+  eng cancel JOBID...|--all|--pending|--name N   (skips your current/ccl jobs unless --force)
+  eng update JOBID [--time T|--partition P|--cpus N|--mem M|--gpus N|--hold|--release]
+
+Discover compute
+  eng partitions              partitions, idle nodes, time limits
+  eng resources [PARTITION]   per-node free CPUs / memory / GPUs
+  eng gpus                    GPU types available and current usage
+  eng limits                  your account/QOS limits
+  eng quota                   storage usage
+  eng modules [PATTERN]       available software modules
+
+Files
+  eng push LOCAL [REMOTE]     ssh mode: rsync to cluster (skips .git, venvs, caches)
+  eng pull REMOTE [LOCAL]     ssh mode: rsync from cluster
+
+  eng config                  show effective configuration
+  eng submit --help           list all resource options
+EOF
+}
+
+main() {
+  local sub="${1:-help}"; shift || true
+  case "$sub" in
+    connect) cmd_connect "$@" ;; disconnect) cmd_disconnect ;; check) cmd_check ;;
+    submit|batch) cmd_submit "$@" ;; sbatch) cmd_sbatch "$@" ;; srun|exec) cmd_srun "$@" ;;
+    interactive|salloc) cmd_interactive "$@" ;; run|ssh) cmd_run "$@" ;;
+    status|squeue|queue|q) cmd_status "$@" ;; logs|log|tail) cmd_logs "$@" ;; wait) cmd_wait "$@" ;;
+    history|sacct) cmd_history "$@" ;; efficiency|seff) cmd_efficiency "$@" ;;
+    cancel|scancel|kill) cmd_cancel "$@" ;; update|modify) cmd_update "$@" ;;
+    partitions|sinfo) cmd_partitions ;; resources|nodes) cmd_resources "$@" ;; gpus) cmd_gpus ;;
+    limits) cmd_limits ;; quota|disk) cmd_quota ;; modules|module) cmd_modules "$@" ;;
+    push) cmd_push "$@" ;; pull) cmd_pull "$@" ;; config) cmd_config ;;
+    help|-h|--help) usage ;;
+    *) die "unknown command '$sub' (see eng help)" ;;
+  esac
+}
+
+main "$@"

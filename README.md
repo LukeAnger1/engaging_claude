@@ -31,6 +31,8 @@ To make the toggle permanent, add `source ~/engaging_claude/shell/ccl.bashrc` to
 | `ccl attach [jobid]` | Attaches Claude Code to a running server (`srun --overlap` if it's on another node) |
 | `ccl status` / `ccl stop [jobid\|all]` | Lists or stops servers (`stop` cancels kept `-k` jobs) |
 | `ccl-setup list\|pull\|default\|add\|remove\|login\|info` | Model registry and weights |
+| `ccl-setup skill [--remove]` | Installs the `engaging` Claude Code skill (see [General Slurm jobs](#general-slurm-jobs-eng)) |
+| `eng submit\|srun\|status\|logs\|wait\|cancel\|gpus\|...` | General CPU/GPU Slurm jobs, built for Claude Code to drive (see below) |
 
 **Options:**
 - `-l` is the number of GPUs for the model (tensor parallel).
@@ -105,6 +107,71 @@ The directory for `-o` must already exist, or Slurm drops the output.
 
 Use `squeue --me -n ccl-batch` to check on jobs and `scancel <jobid>` to cancel one. Server logs are at
 `~/.ccl/run/<jobid>.<model>.log`.
+
+## General Slurm jobs (`eng`)
+
+`ccl` runs Claude Code. `eng` lets Claude Code (or you) run **other** work on Engaging:
+- CPU and GPU batch jobs, job arrays and dependency chains
+- blocking `srun` commands
+- queue and log monitoring, and finding which GPUs and partitions are free
+
+A Claude Code skill (`skills/engaging/SKILL.md`) teaches the model when and how to use it.
+
+```bash
+ccl-setup skill          # symlink the skill into ~/.claude/skills (ccl-setup install also does this)
+eng check                # "CONNECTED (local mode)" on Engaging
+```
+
+After that, prompts like *"train this on an H100 overnight and tell me when it's done"* or
+*"run this sweep over 20 seeds as a job array"* work. The model checks limits, makes a dry run,
+submits, then follows the job with `eng status` / `eng logs` / `eng wait`.
+
+```bash
+# CPU batch job in the current directory
+eng submit -c 8 -m 32G -t 4:00:00 -- python analyze.py
+
+# GPU job (picks mit_normal_gpu; defaults to CCL_CPUS_PER_GPU / CCL_MEM_PER_GPU per GPU)
+eng submit -g 1 --gpu-type h100 -t 6:00:00 --conda myenv -- python train.py
+
+# More GPUs or time than mit_normal_gpu allows: preemptable, up to 2 days
+eng submit --preemptable --requeue -g 4 -t 2-00:00:00 -- python train.py --resume
+
+# Job array (single-quote $SLURM_ARRAY_TASK_ID) and a dependent job
+eng submit -J sweep -a 0-19%4 -g 1 -- python run.py --seed '$SLURM_ARRAY_TASK_ID'
+eng submit -d 1234567 -- python aggregate.py
+
+# Short blocking run on a compute node, output comes straight back
+eng srun -g 1 -t 10:00 -- python -c 'import torch; print(torch.cuda.get_device_name())'
+
+eng submit -g 2 -t 4:00:00 --dry-run -- python train.py   # preview the generated script
+eng status                 # your queue; `eng status <id>` = one job / final accounting
+eng logs -f <id>           # follow output (logs: ~/.ccl/jobs/logs/<name>-<id>.out)
+eng wait <id>              # block until done; nonzero exit if it failed
+eng efficiency <id>        # seff: was the request the right size?
+eng cancel <id>            # also --pending, --name N, --all
+eng update <id> --time 2:00:00
+eng gpus; eng partitions; eng resources mit_normal_gpu; eng limits; eng quota; eng modules cuda
+```
+
+See `eng help` and `eng submit --help` for all options, and `examples/` for an sbatch script, a sweep, and a
+CPU-to-GPU pipeline.
+
+Behavior to know about:
+- **Running from inside a `ccl` session:**
+  - `eng` strips `SLURM_*`, `CUDA_VISIBLE_DEVICES`, `ANTHROPIC_*` and `CCL_*` before submitting, so new jobs
+    get their own allocation and don't inherit the session's GPUs or local-model settings.
+  - `eng cancel` never cancels the job it is running in or `ccl`/`ccl-serve`/`ccl-batch` jobs unless you pass
+    `--force`.
+- **The 2-GPU QoS cap includes your `ccl` session.** A GPU job submitted while `ccl` holds 2 GPUs pends
+  until the session ends. `eng` warns about this and about requests over the cap or the 6 h limit.
+  Use `--preemptable` instead.
+- **From a laptop (ssh mode):**
+  - Set `ENG_USER` to your Kerberos username. Then run `eng connect` once (password + Duo).
+    It opens an SSH ControlMaster connection that every later `eng` command reuses without prompting.
+    Claude Code on your laptop can drive Engaging this way. `eng push` / `eng pull` rsync files.
+  - Install the skill with `bin/ccl-setup skill` on the laptop too.
+- **Configuration:** the `ENG_*` block in `lib/common.sh`, overridable in `config.local.sh`. It holds partitions,
+  limits, default modules, account, and log dirs. `eng config` shows the effective values.
 
 ## How it works
 
