@@ -26,8 +26,9 @@ cmd_install() {
     info "creating venv $CCL_VENV (python $CCL_PYTHON)"
     uv venv --python "$CCL_PYTHON" "$CCL_VENV"
   fi
-  info "installing $CCL_VLLM_SPEC + huggingface_hub (this takes a while)"
-  uv pip install --python "$CCL_VENV/bin/python" "$CCL_VLLM_SPEC" huggingface_hub
+  info "installing $CCL_VLLM_SPEC + huggingface_hub + ray (this takes a while)"
+  # ray[cgraph]: multi-node serving for `ccl multi` (vLLM's Ray executor uses compiled graphs for PP).
+  uv pip install --python "$CCL_VENV/bin/python" "$CCL_VLLM_SPEC" huggingface_hub "ray[cgraph]"
   # Prebuilt FlashInfer kernels: compute nodes have no nvcc/CUDA toolkit, so JIT builds fail
   # ("Could not find nvcc"). `vllm download-kernels` can't run on the login node (no libcuda),
   # so call flashinfer's installer directly. Run from /tmp so cwd isn't on sys.path.

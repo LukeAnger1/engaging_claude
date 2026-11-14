@@ -526,7 +526,7 @@ cmd_cancel() {
 $(cat <<'BODY'
 ids=$(squeue --me -h $FILTER -o '%i %j' | while read -r id name; do
   base=${id%%_*}
-  if [[ $FORCE == 0 && ( $base == "$KEEP" || $name =~ ^ccl(-serve|-batch)?$ ) ]]; then
+  if [[ $FORCE == 0 && ( $base == "$KEEP" || $name =~ ^ccl(-serve|-batch|-multi|-multi-w)?$ ) ]]; then
     echo "skipping $id ($name)" >&2; continue
   fi
   echo "$id"

@@ -26,6 +26,7 @@ To make the toggle permanent, add `source ~/engaging_claude/shell/ccl.bashrc` to
 | `ccl local` / `claude` | Attaches to a running server (this job first, then any of your running jobs), otherwise `ccl $CCL_DEFAULT_ARGS` |
 | `ccl cloud` / `claude --cloud` | Normal Claude Code with your Anthropic login |
 | `ccl batch [run options] [-o FILE] "prompt"` | Submits an sbatch job that runs one `-p` prompt (with `--dangerously-skip-permissions`), then stops the server and frees the GPUs |
+| `ccl multi [-n N] [-s pp\|tp] [run options] [-- claude args]` | Submits N sbatch jobs (default 2), waits until all are running, serves **one** model across all their GPUs, and opens Claude Code (see [Multi-job](#one-model-across-several-jobs-ccl-multi)) |
 | `ccl mode [local\|cloud]` | Sets what plain `claude` means |
 | `ccl which` / `claude --which` | Shows what would happen |
 | `ccl attach [jobid]` | Attaches Claude Code to a running server (`srun --overlap` if it's on another node) |
@@ -107,6 +108,43 @@ The directory for `-o` must already exist, or Slurm drops the output.
 
 Use `squeue --me -n ccl-batch` to check on jobs and `scancel <jobid>` to cancel one. Server logs are at
 `~/.ccl/run/<jobid>.<model>.log`.
+
+## One model across several jobs (`ccl multi`)
+
+A single Slurm request can hold at most **2 GPUs**, but you can have more than one job running at the same time.
+`ccl multi` uses that to put one model on more GPUs than a single job allows:
+
+1. It submits a **head job** (`ccl-multi`) and N-1 **worker jobs** (`ccl-multi-w`), N=2 by default.
+2. It waits, printing each job's queue state, until **all** of them are running.
+3. The jobs join into one Ray cluster and vLLM serves the model across all of their GPUs:
+   tensor parallel inside each job and pipeline parallel across jobs (`-s pp`, the default).
+4. Once the model is up, interactive Claude Code opens on the head job's node. It reads your prompt and makes the changes, just like with plain `ccl`.
+5. When you exit Claude Code, every job is cancelled. With `-k` they keep running until walltime or `ccl stop <head jobid>`.
+
+```bash
+ccl multi -m gpt-oss-120b -g h100                 # 2 jobs x 2 GPUs: TP=2 x PP=2 on 4 GPUs
+ccl multi -m qwen3-coder-30b -t 1                 # head: 1 model + 1 Claude GPU, worker: 1 model GPU
+ccl multi -m gpt-oss-120b -k -- "Implement the TODOs in src/"   # start Claude Code with a first prompt; keep the jobs
+claude                                            # later: plain `claude` re-attaches to the kept head job
+```
+
+Options (plus the usual `-m -c -g -T -p -k`):
+- `-n N` sets the number of jobs. The default is `CCL_MULTI_JOBS=2`.
+- `-l N` sets the model GPUs **per job**. The default fills each job to `CCL_MULTI_GPUS_PER_JOB=2`, minus `-t` on the head job.
+- `-t N` sets the GPUs for Claude Code and what it runs. They come only from the head job, so the head job gets `-l` + `-t`.
+- `-s pp|tp`: `pp` (default) keeps the bandwidth-heavy tensor parallel traffic inside a node.
+  `tp` makes one tensor-parallel group over all GPUs. It only makes sense if the jobs land on the same node or on a fast interconnect.
+
+Notes:
+- Ray is installed by `ccl-setup install` (`ray[cgraph]`). If you installed before this mode existed, rerun it.
+- Ctrl-C while waiting for the queue cancels all the jobs. If one job ends, the others are cancelled too.
+- A job that starts first holds its GPUs idle until the others start. Its walltime is already counting.
+- `ccl status` lists the head job along with its worker jobs. `ccl stop <head>` cancels all of them.
+- Logs: `~/.ccl/run/<jobid>.out` per job, `~/.ccl/run/<head>.ray-head.log`, and the vLLM log
+  `~/.ccl/run/<head>.<model>.log`. Rendezvous files are in `~/.ccl/run/multi-<head>/`.
+- **Cross-node networking:** the jobs talk to each other over the cluster network (Ray + NCCL). If NCCL picks the wrong
+  interface or hangs at load, set e.g. `CCL_MULTI_ENV="NCCL_SOCKET_IFNAME=ib0"` (applied on every node).
+  If `getent hosts $(hostname)` doesn't give the right IP, set `CCL_MULTI_IP_CMD` to a command that does.
 
 ## General Slurm jobs (`eng`)
 

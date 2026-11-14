@@ -11,6 +11,8 @@ usage: ccl [run] [options] [-- claude args...]   start/reuse a local model serve
        ccl local [-- claude args]    attach to a running server (this job, then any of your jobs), else run defaults
        ccl cloud [claude args]       normal Claude Code with your Anthropic login
        ccl batch [options] [-o FILE] prompt  sbatch one -p prompt (skips permission prompts), then free GPUs
+       ccl multi [-n N] [-s pp|tp] [options] [-- claude args]
+                                     sbatch N jobs (default 2), serve ONE model across all their GPUs, open Claude Code
        ccl mode [local|cloud]        what plain 'claude' uses (needs: source shell/ccl.bashrc)
        ccl which                     show what plain 'claude' would do
        ccl attach [jobid] [-- args]  attach Claude Code to a running server
@@ -28,6 +30,12 @@ run options:
   -T TIME   walltime for new allocations     (default: $CCL_TIME)
   -p PART   partition for new allocations    (default: $CCL_PARTITION)
   -o FILE   batch only: output file           (default: ccl-batch-<jobid>.out)
+
+multi options (ccl multi; -l/-t are per job, -t only on the head job where Claude Code runs):
+  -n N      number of sbatch jobs             (default: $CCL_MULTI_JOBS)
+  -s pp|tp  how jobs are combined: pp = tensor parallel inside a job, pipeline parallel across jobs
+            (default, much less cross-node traffic); tp = one tensor-parallel group over all GPUs
+  -l N      model GPUs per job                (default: $CCL_MULTI_GPUS_PER_JOB minus -t)
 EOF
 }
 
@@ -40,14 +48,14 @@ state_file() { echo "$CCL_RUN_DIR/$1.env"; }
 # Load a state file into S_* variables. Returns 1 if missing.
 load_state() {
   local f; f="$(state_file "$1")"; [[ -f "$f" ]] || return 1
-  unset S_JOBID S_PID S_PORT S_MODEL S_HOST S_MODEL_GPUS S_TASK_GPUS S_LOG S_KIND S_READY S_MAX_LEN
+  unset S_JOBID S_PID S_PORT S_MODEL S_HOST S_MODEL_GPUS S_TASK_GPUS S_LOG S_KIND S_READY S_MAX_LEN S_PEERS
   # shellcheck disable=SC1090
   source "$f"
 }
 write_state() {  # key=value pairs
   local f; f="$(state_file "$S_JOBID")"
   {
-    for k in S_JOBID S_PID S_PORT S_MODEL S_HOST S_MODEL_GPUS S_TASK_GPUS S_LOG S_KIND S_READY S_MAX_LEN; do
+    for k in S_JOBID S_PID S_PORT S_MODEL S_HOST S_MODEL_GPUS S_TASK_GPUS S_LOG S_KIND S_READY S_MAX_LEN S_PEERS; do
       printf '%s=%q\n' "$k" "${!k:-}"
     done
   } >"$f.tmp" && mv -f "$f.tmp" "$f"
@@ -98,6 +106,8 @@ stop_server_here() {  # uses S_*
 }
 
 # start_server KIND -> sets S_* and writes state (READY=0). Needs M_*, MODEL_GPUS, TASK_GPUS, CTX, L.
+# Optional: SERVE_PAR (parallelism args, default TP=L) and SERVE_ENV (extra VAR=value for vLLM).
+SERVE_PAR=() SERVE_ENV=()
 start_server() {
   [[ -x "$CCL_VENV/bin/vllm" ]] || die "vLLM not installed (run: ccl-setup install)"
   model_pulled "$M_NAME" || die "model '$M_NAME' not downloaded (run on login node: ccl-setup pull $M_NAME)"
@@ -106,14 +116,15 @@ start_server() {
   local -a tool=()
   [[ "$M_PARSER" != - ]] && tool=(--enable-auto-tool-choice --tool-call-parser "$M_PARSER")
   local -a extra=(); read -r -a extra <<<"${CCL_VLLM_EXTRA:-}"
-  info "starting vLLM: $M_NAME on GPU(s) $MODEL_GPUS (TP=$L, ctx=$CTX, port $port); log: $log"
+  local -a par=("${SERVE_PAR[@]}"); ((${#par[@]})) || par=(--tensor-parallel-size "$L")
+  info "starting vLLM: $M_NAME on GPU(s) $MODEL_GPUS (${par[*]}, ctx=$CTX, port $port); log: $log"
   # setsid: own session, so Ctrl-C / terminal hangup in Claude Code doesn't reach it.
-  CUDA_VISIBLE_DEVICES="$MODEL_GPUS" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  env "${SERVE_ENV[@]}" CUDA_VISIBLE_DEVICES="$MODEL_GPUS" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   VLLM_CACHE_ROOT="$CCL_DATA/cache/vllm" TRITON_CACHE_DIR="$CCL_DATA/cache/triton" \
   XDG_CACHE_HOME="$CCL_DATA/cache" VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1 \
     setsid "$CCL_VENV/bin/vllm" serve "$(model_path "$M_NAME")" \
       --served-model-name "$M_NAME" --host 127.0.0.1 --port "$port" \
-      --tensor-parallel-size "$L" --max-model-len "$CTX" \
+      "${par[@]}" --max-model-len "$CTX" \
       "${tool[@]}" "${M_EXTRA[@]}" "${extra[@]}" \
       </dev/null >"$log" 2>&1 &
   S_PID=$! S_PORT=$port S_MODEL=$M_NAME S_HOST="$(host_s)" S_JOBID=$SLURM_JOB_ID
@@ -392,6 +403,7 @@ cmd_status() {
     fi
     printf 'job %-10s %-8s %-20s host=%-10s port=%-6s model_gpus=%-5s task_gpus=%-5s kind=%-5s %s\n' \
       "$j" "$st" "$S_MODEL" "$S_HOST" "$S_PORT" "$S_MODEL_GPUS" "${S_TASK_GPUS:--}" "$S_KIND" "$health"
+    [[ -n "${S_PEERS:-}" ]] && echo "    worker jobs: $S_PEERS (model spans $((1 + $(tr -cd , <<<"$S_PEERS" | wc -c))) jobs)"
     echo "    log: $S_LOG"
   done
   ((any)) || echo "no ccl servers running"
@@ -400,8 +412,10 @@ cmd_status() {
 stop_one() {
   local j=$1
   load_state "$j" || { warn "no server recorded for job $j"; return 1; }
-  if [[ "$S_KIND" == batch ]]; then
-    info "cancelling server job $j"; scancel "$j"; rm -f "$(state_file "$j")"; return
+  if [[ "$S_KIND" == batch || "$S_KIND" == multi ]]; then
+    local -a peers=(); IFS=, read -r -a peers <<<"${S_PEERS:-}"
+    info "cancelling server job $j${S_PEERS:+ and worker job(s) ${S_PEERS}}"
+    scancel "$j" "${peers[@]}"; rm -f "$(state_file "$j")"; return
   fi
   if [[ "$S_HOST" == "$(host_s)" ]]; then stop_server_here; return; fi
   job_running "$j" || { rm -f "$(state_file "$j")"; return; }
@@ -467,6 +481,225 @@ cmd_batch() {
   info "submitted batch job $jobid ($NEED GPU(s)); output -> ${out//%j/$jobid}"
 }
 
+# ---------------------------------------------------------------- multi: one model across several jobs
+# The QoS caps one request at 2 GPUs but allows several jobs at once. `ccl multi` submits a head job and
+# N-1 worker jobs, joins them into a Ray cluster, and serves one vLLM model over all their GPUs.
+# Rendezvous happens in $CCL_RUN_DIR/multi-<headjob>/ ($HOME is shared by all nodes):
+#   workers      worker job ids (written by the submitter)
+#   head.addr    ip:port of the Ray head (written by the head job once Ray is up)
+#   phase        one-line progress message from the head job
+multi_dir() { echo "$CCL_RUN_DIR/multi-$1"; }
+
+node_ip() {
+  if [[ -n "${CCL_MULTI_IP_CMD:-}" ]]; then eval "$CCL_MULTI_IP_CMD"; return; fi
+  local ip; ip="$(getent hosts "$(hostname)" 2>/dev/null | awk '{print $1; exit}')"
+  [[ -z "$ip" || "$ip" == 127.* ]] && ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  echo "$ip"
+}
+
+# Env for Ray on a compute node: per-job temp dir (/tmp/ray is shared between users on a node).
+ray_env() {
+  export RAY_TMPDIR="/tmp/ccl-ray-$USER-$SLURM_JOB_ID" RAY_USAGE_STATS_ENABLED=0
+  mkdir -p "$RAY_TMPDIR"
+  local -a extra=(); read -r -a extra <<<"${CCL_MULTI_ENV:-}"
+  local kv; for kv in "${extra[@]}"; do export "${kv?}"; done
+}
+
+# Common `ray start` flags. Fixed default ports (ray client 10001, dashboard agent 52365) collide
+# when several users run Ray on one node, so pick free ones.
+ray_start_flags() {
+  RAY_FLAGS=(--block --disable-usage-stats --node-ip-address="$1" --num-gpus="$2"
+             --num-cpus="${SLURM_CPUS_PER_TASK:-$((CCL_CPUS_PER_GPU * $2))}"
+             --dashboard-agent-listen-port="$(free_port)")
+}
+
+# Total GPUs registered in the Ray cluster at $1 (prints 0 if unreachable).
+ray_cluster_gpus() {
+  (cd /tmp && "$CCL_VENV/bin/python" -I -c '
+import sys, ray
+ray.init(address=sys.argv[1], logging_level="ERROR", log_to_driver=False)
+print(int(ray.cluster_resources().get("GPU", 0)))' "$1" 2>/dev/null) || echo 0
+}
+
+job_alive() { local st; st="$(squeue -h -j "$1" -o %T 2>/dev/null)"; [[ -n "$st" && "$st" != COMPLETING ]]; }
+
+multi_phase() { echo "$*" >"$MDIR/phase.tmp" && mv -f "$MDIR/phase.tmp" "$MDIR/phase"; info "$*"; }
+
+# Body of the head job: ccl _multi_head N SPLIT <resolved run opts>
+cmd__multi_head() {
+  local n=$1 split=$2; shift 2
+  parse_run_opts "$@"
+  local gl; gl="$(visible_gpus)"
+  local -a gpus=(); IFS=, read -r -a gpus <<<"$gl"
+  ((${#gpus[@]} >= NEED)) || die "head job sees ${#gpus[@]} GPU(s), need $NEED"
+  MODEL_GPUS="$(IFS=,; echo "${gpus[*]:0:L}")"
+  TASK_GPUS="$(IFS=,; echo "${gpus[*]:L:T}")"
+  MDIR="$(multi_dir "$SLURM_JOB_ID")"; mkdir -p "$MDIR"
+
+  local t0=$SECONDS
+  until [[ -s "$MDIR/workers" ]]; do
+    ((SECONDS - t0 > 300)) && die "no worker job list in $MDIR after 5 min; was submission interrupted?"
+    sleep 2
+  done
+  local -a workers=(); read -r -a workers <"$MDIR/workers"
+  local peers; peers="$(IFS=,; echo "${workers[*]}")"
+
+  ray_env
+  local ip gport; ip="$(node_ip)"; gport="$(free_port)"
+  [[ -n "$ip" ]] || die "could not determine this node's IP (set CCL_MULTI_IP_CMD)"
+  ray_start_flags "$ip" "$L"
+  local raylog="$CCL_RUN_DIR/$SLURM_JOB_ID.ray-head.log"
+  CUDA_VISIBLE_DEVICES="$MODEL_GPUS" VLLM_HOST_IP="$ip" \
+    setsid "$CCL_VENV/bin/ray" start --head --port="$gport" --include-dashboard=false \
+      --ray-client-server-port="$(free_port)" --temp-dir="$RAY_TMPDIR" "${RAY_FLAGS[@]}" \
+      </dev/null >"$raylog" 2>&1 &
+  local ray_pid=$!
+  # On exit: stop vLLM and Ray, and take the worker jobs down with us.
+  trap 'stop_server_here; kill -TERM -- "-'"$ray_pid"'" 2>/dev/null; scancel '"${workers[*]}"' 2>/dev/null; rm -f "$MDIR/head.addr"; exit 0' TERM INT HUP
+  trap 'kill -TERM -- "-'"$ray_pid"'" 2>/dev/null; scancel '"${workers[*]}"' 2>/dev/null; rm -f "$MDIR/head.addr"' EXIT
+
+  local addr="$ip:$gport" want=$((L * n)) have=0 last=-1
+  multi_phase "starting Ray head on $(host_s) ($addr); log: $raylog"
+  t0=$SECONDS
+  until (($(ray_cluster_gpus "$addr") > 0)); do
+    kill -0 "$ray_pid" 2>/dev/null || { tail -n 30 "$raylog" >&2; die "Ray head failed to start"; }
+    ((SECONDS - t0 > 300)) && { tail -n 30 "$raylog" >&2; die "Ray head not reachable after 5 min"; }
+    sleep 3
+  done
+  echo "$addr" >"$MDIR/head.addr"
+  while :; do
+    have="$(ray_cluster_gpus "$addr")"
+    ((have >= want)) && break
+    ((have != last)) && multi_phase "Ray cluster has $have/$want GPUs; waiting for worker job(s) ${peers}" && last=$have
+    local w; for w in "${workers[@]}"; do job_alive "$w" || die "worker job $w ended before joining (see $CCL_RUN_DIR/$w.out)"; done
+    kill -0 "$ray_pid" 2>/dev/null || die "Ray head exited (see $raylog)"
+    sleep 5
+  done
+
+  if [[ "$split" == tp ]]; then
+    SERVE_PAR=(--tensor-parallel-size "$want" --pipeline-parallel-size 1)
+  else
+    SERVE_PAR=(--tensor-parallel-size "$L" --pipeline-parallel-size "$n")
+  fi
+  SERVE_PAR+=(--distributed-executor-backend ray)
+  SERVE_ENV=(RAY_ADDRESS="$addr" VLLM_HOST_IP="$ip")
+  multi_phase "all $want GPUs joined; loading $M_NAME (${SERVE_PAR[*]})"
+  start_server multi
+  S_PEERS=$peers; write_state
+  wait_ready || exit 1
+  multi_phase "ready: $M_NAME on $want GPUs across $n jobs"
+  while kill -0 "$S_PID" 2>/dev/null; do wait "$S_PID" 2>/dev/null; done
+  warn "vLLM exited; tail of log:"; tail -n 20 "$S_LOG" >&2
+  rm -f "$(state_file "$S_JOBID")"
+}
+
+# Body of a worker job: ccl _multi_worker HEADJOB L
+cmd__multi_worker() {
+  local head=$1 l=$2
+  MDIR="$(multi_dir "$head")"
+  local gl; gl="$(visible_gpus)"
+  local -a gpus=(); IFS=, read -r -a gpus <<<"$gl"
+  ((${#gpus[@]} >= l)) || die "worker job sees ${#gpus[@]} GPU(s), need $l"
+  info "worker for head job $head on $(host_s); waiting for the Ray head"
+  local addr="" t0=$SECONDS
+  while :; do
+    [[ -s "$MDIR/head.addr" ]] && addr="$(<"$MDIR/head.addr")" && break
+    job_alive "$head" || die "head job $head is gone"
+    sleep 5
+  done
+  info "head job running after $((SECONDS - t0))s; joining Ray at $addr"
+  ray_env
+  local ip; ip="$(node_ip)"
+  [[ -n "$ip" ]] || die "could not determine this node's IP (set CCL_MULTI_IP_CMD)"
+  ray_start_flags "$ip" "$l"
+  CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${gpus[*]:0:l}")" VLLM_HOST_IP="$ip" \
+    exec "$CCL_VENV/bin/ray" start --address="$addr" "${RAY_FLAGS[@]}"
+}
+
+# ccl multi [-n N] [-s pp|tp] [run options] [-- claude args]: run from the login node.
+cmd_multi() {
+  local n=$CCL_MULTI_JOBS split=pp have_l=0
+  local -a run_args=()
+  while (($#)); do
+    case "$1" in
+      -n) n=${2:?-n needs a value}; shift 2 ;;
+      -s) split=${2:?-s needs a value}; shift 2 ;;
+      -l) have_l=1; run_args+=("$1" "${2:?-l needs a value}"); shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      --) run_args+=("$@"); break ;;
+      *) run_args+=("$1"); shift ;;
+    esac
+  done
+  [[ "$n" =~ ^[0-9]+$ ]] && ((n >= 2)) || die "-n must be >= 2 (use plain 'ccl' for one job)"
+  [[ "$split" == pp || "$split" == tp ]] || die "-s must be pp or tp"
+  [[ -z "${SLURM_JOB_ID:-}" ]] || die "run 'ccl multi' from the login node (it submits its own jobs)"
+  [[ -x "$CCL_VENV/bin/ray" ]] || die "Ray is not installed in $CCL_VENV (rerun: ccl-setup install)"
+
+  parse_run_opts "${run_args[@]}"
+  if ((!have_l)); then L=$((CCL_MULTI_GPUS_PER_JOB - T)); ((L >= 1)) || L=1; NEED=$((L + T)); fi
+  ((NEED <= ENG_MAX_GPUS)) || warn "head job asks for $NEED GPUs (-l $L + -t $T), over the ${ENG_MAX_GPUS}-GPU per-request cap; it may never start"
+  resolved_opts
+  model_pulled "$M_NAME" || die "model '$M_NAME' not downloaded (run on login node: ccl-setup pull $M_NAME)"
+  local total=$((L * n))
+  [[ "$split" == pp ]] || (( (total & (total - 1)) == 0 )) || warn "-s tp with $total GPUs: most models need a power-of-two TP size"
+
+  # Head job: model GPUs + Claude Code's task GPUs. Workers: model GPUs only.
+  slurm_res_args; local -a head_res=("${RES[@]}")
+  NEED=$L; slurm_res_args; local -a worker_res=("${RES[@]}"); NEED=$((L + T))
+  local head
+  head="$(sbatch --parsable -J ccl-multi "${head_res[@]}" -o "$CCL_RUN_DIR/%j.out" \
+          --wrap "exec $(printf '%q ' "$SELF" _multi_head "$n" "$split" "${RESOLVED[@]}")")" || die "sbatch failed"
+  head="${head%%;*}"
+  local -a jobs=("$head") workers=()
+  trap 'warn "interrupted; cancelling jobs ${jobs[*]}"; scancel "${jobs[@]}"; exit 130' INT TERM HUP
+  local i w
+  for ((i = 1; i < n; i++)); do
+    w="$(sbatch --parsable -J ccl-multi-w "${worker_res[@]}" -o "$CCL_RUN_DIR/%j.out" \
+         --wrap "exec $(printf '%q ' "$SELF" _multi_worker "$head" "$L")")" || { scancel "${jobs[@]}"; die "sbatch failed"; }
+    w="${w%%;*}"; jobs+=("$w"); workers+=("$w")
+  done
+  MDIR="$(multi_dir "$head")"; mkdir -p "$MDIR"
+  echo "${workers[*]}" >"$MDIR/workers"
+  info "submitted head job $head ($NEED GPU(s)) + worker job(s) ${workers[*]} ($L GPU(s) each)"
+  info "model: $M_NAME on $total GPUs ($( [[ $split == pp ]] && echo "TP=$L x PP=$n" || echo "TP=$total")), Claude Code GPUs: $T"
+  info "Ctrl-C while waiting cancels all of them"
+
+  local last="" line st reason j all_running
+  while :; do
+    line="" all_running=1
+    for j in "${jobs[@]}"; do
+      st="" reason=""
+      read -r st reason < <(squeue -h -j "$j" -o '%T %r' 2>/dev/null)
+      case "${st:-}" in
+        RUNNING) line+=" $j=running" ;;
+        PENDING|CONFIGURING) all_running=0; line+=" $j=pending($reason)" ;;
+        *) warn "job $j ended (${st:-gone}). Output:"; tail -n 40 "$CCL_RUN_DIR/$j.out" >&2
+           scancel "${jobs[@]}" 2>/dev/null; exit 1 ;;
+      esac
+    done
+    ((all_running)) && [[ -s "$MDIR/phase" ]] && line+=" | $(<"$MDIR/phase")"
+    [[ "$line" != "$last" ]] && info "${line# }" && last=$line
+    if ((all_running)) && load_state "$head" && [[ "$S_READY" == 1 ]]; then break; fi
+    sleep 5
+  done
+  info "model ready in job $head on $S_HOST; opening Claude Code"
+
+  local -a extra=(); read -r -a extra <<<"${CCL_ATTACH_SRUN_EXTRA:-}"
+  if ((OPT_KEEP)); then
+    trap - INT TERM HUP
+    info "-k: jobs keep running after Claude Code exits ('ccl stop $head' cancels all of them)"
+    exec srun --jobid "$head" --overlap "${PTY[@]}" "${extra[@]}" "$SELF" attach "$head" -- "${CLAUDE_ARGS[@]}"
+  fi
+  trap ':' INT   # Ctrl-C belongs to Claude Code
+  trap 'scancel "${jobs[@]}"; exit 129' TERM HUP
+  srun --jobid "$head" --overlap "${PTY[@]}" "${extra[@]}" "$SELF" attach "$head" -- "${CLAUDE_ARGS[@]}"
+  local rc=$?
+  info "Claude Code exited; cancelling jobs ${jobs[*]}"
+  scancel "${jobs[@]}"
+  rm -f "$(state_file "$head")"
+  return $rc
+}
+
 cmd_mode() {
   case "${1:-}" in
     "") echo "$(get_mode)" ;;
@@ -480,6 +713,9 @@ case "${1:-}" in
   local)   shift; cmd_local "$@" ;;
   cloud)   shift; cmd_cloud "$@" ;;
   batch)   shift; cmd_batch "$@" ;;
+  multi)   shift; cmd_multi "$@" ;;
+  _multi_head)   shift; cmd__multi_head "$@" ;;
+  _multi_worker) shift; cmd__multi_worker "$@" ;;
   mode)    shift; cmd_mode "$@" ;;
   which)   shift; cmd_which ;;
   attach)  shift; cmd_attach "$@" ;;

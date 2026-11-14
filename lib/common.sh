@@ -32,6 +32,12 @@ CCL_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Seconds to wait for vLLM /health.
 : "${CCL_READY_TIMEOUT:=1800}"
 
+# ccl multi: one model across several sbatch jobs (each request is capped at 2 GPUs).
+: "${CCL_MULTI_JOBS:=2}"           # number of jobs (-n)
+: "${CCL_MULTI_GPUS_PER_JOB:=2}"   # GPUs per job when -l isn't given (head job: model + -t)
+: "${CCL_MULTI_ENV:=}"             # extra VAR=value for Ray/vLLM on every node, e.g. "NCCL_SOCKET_IFNAME=ib0"
+: "${CCL_MULTI_IP_CMD:=}"          # command printing this node's IP, if `getent hosts $(hostname)` is wrong
+
 # ---- eng (general Slurm jobs: bin/eng) ----
 : "${ENG_MODE:=auto}"                    # auto | local (sbatch on PATH) | ssh (from a laptop)
 : "${ENG_CPU_PARTITION:=mit_normal}"
